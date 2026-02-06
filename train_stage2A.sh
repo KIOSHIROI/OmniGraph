@@ -1,0 +1,15 @@
+python omnigraph/train/train_projector.py \
+  --scene_graphs data/vg/contents/sceneGraphs/scene_graphs.json \
+  --regions data/vg/contents/regionDescriptions/region_descriptions.json \
+  --gpu 0 \
+  --batch_size 2 \
+  --precision 32 \
+  --max_length 256 \
+  --num_workers 4 \
+  --val_ratio 0.001 \
+  --patience 2 \
+  --min_delta 0.01 \
+  --lr 5e-5 \
+  --max_steps 80000 \
+  --val_check_interval 2000 \
+  --save_dir checkpoints_projector_vg/stage2A

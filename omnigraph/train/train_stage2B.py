@@ -1,17 +1,16 @@
-# omnigraph/train/train_projector.py
+# omnigraph/train/train_stage2B.py
 from __future__ import annotations
 
 import sys
 import json
-import random
 import argparse
+import random
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple
 
 # ---------------------------------------------------------------------------
-# Repo bootstrap + env (must be before transformers import)
+# Repo bootstrap + env
 # ---------------------------------------------------------------------------
-
 _repo_root = Path(__file__).resolve().parents[2]
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
@@ -23,16 +22,11 @@ import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset, Subset
-
+from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
-from pytorch_lightning.callbacks import (
-    ModelCheckpoint,
-    LearningRateMonitor,
-    EarlyStopping,
-)
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
 
-# Dataset
+# Dataset (你已有)
 from omnigraph.data.vg_scene_graph_dataset import (  # noqa: E402
     build_vg_vocabs_from_file,
     VGSceneGraphDataset,
@@ -44,17 +38,16 @@ from omnigraph.model.OmniGraphModel import OmniGraphModel  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# Regions: loader + dataset wrapper
+# Region loader + wrapper dataset
 # ---------------------------------------------------------------------------
-
 def load_region_pairs(region_path: str) -> List[Tuple[int, str]]:
     """
-    region_descriptions.json format:
+    region_descriptions.json:
     [
       {"regions":[{"image_id":26,"phrase":"..."}, ...], "id":26},
       ...
     ]
-    Returns: [(image_id, phrase), ...]
+    return [(image_id, phrase), ...]
     """
     with open(region_path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -84,14 +77,13 @@ def load_region_pairs(region_path: str) -> List[Tuple[int, str]]:
             phrase = str(r.get("phrase", "")).strip()
             if phrase:
                 pairs.append((image_id, phrase))
-
     return pairs
 
 
-class VGGraphRegionTextDataset(Dataset):
+class VGGraphRegionTextDataset(torch.utils.data.Dataset):
     """
-    One sample = (scene graph of image_id) + (one region phrase).
-    Output: {id, image_id, graph_data, text, answer}
+    sample = (scene graph of image_id) + (one region phrase of same image_id)
+    output: {id, graph_data, text, answer}
     """
 
     def __init__(
@@ -103,6 +95,7 @@ class VGGraphRegionTextDataset(Dataset):
         self.sg = sg_dataset
         self.prompt = prompt
 
+        # build image_id -> sg_dataset index
         raw_items = None
         if hasattr(self.sg, "items"):
             raw_items = getattr(self.sg, "items")
@@ -111,7 +104,7 @@ class VGGraphRegionTextDataset(Dataset):
 
         if raw_items is None:
             raise AttributeError(
-                "VGSceneGraphDataset must expose raw scene graph list as .items or .scene_graphs for image_id join."
+                "VGSceneGraphDataset must expose raw list as .items or .scene_graphs to join by image_id."
             )
 
         self.image2idx: Dict[int, int] = {}
@@ -119,68 +112,51 @@ class VGGraphRegionTextDataset(Dataset):
             if isinstance(it, dict) and "image_id" in it:
                 self.image2idx[int(it["image_id"])] = i
 
-        self.samples: List[Tuple[int, str, int]] = []
-        for (iid, phr) in region_pairs:
-            sg_idx = self.image2idx.get(int(iid), None)
-            if sg_idx is None:
-                continue
-            self.samples.append((int(iid), phr, int(sg_idx)))
+        # keep only pairs with existing scene graph
+        self.samples: List[Tuple[int, str]] = [(iid, phr) for iid, phr in region_pairs if iid in self.image2idx]
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        image_id, phrase, sg_idx = self.samples[idx]
+        image_id, phrase = self.samples[idx]
+        sg_idx = self.image2idx[image_id]
         sg_item = self.sg[sg_idx]
         return {
             "id": f"{image_id}_r{idx}",
-            "image_id": int(image_id),
             "graph_data": sg_item["graph_data"],
             "text": self.prompt,
             "answer": phrase,
         }
 
 
-def split_by_image_id(
-    dataset: VGGraphRegionTextDataset,
-    val_ratio: float,
-    seed: int,
-) -> Tuple[Subset, Subset]:
-    """
-    Split by image_id to avoid leakage:
-    all phrases under an image_id go either train or val.
-    """
-    image_ids = sorted({iid for (iid, _, _) in dataset.samples})
-    rng = random.Random(seed)
-    rng.shuffle(image_ids)
+def split_train_val(dataset: torch.utils.data.Dataset, val_ratio: float, seed: int = 42):
+    n = len(dataset)
+    n_val = max(1, int(n * val_ratio)) if val_ratio > 0 else 0
+    idxs = list(range(n))
+    random.Random(seed).shuffle(idxs)
+    val_idxs = set(idxs[:n_val])
+    train_idxs = [i for i in idxs if i not in val_idxs]
 
-    if len(image_ids) <= 1:
-        # degenerate: still create a tiny val
-        val_set = set(image_ids)
-    else:
-        val_n = max(1, int(len(image_ids) * float(val_ratio)))
-        val_set = set(image_ids[:val_n])
+    class _Subset(torch.utils.data.Dataset):
+        def __init__(self, ds, indices):
+            self.ds = ds
+            self.indices = indices
 
-    train_idx: List[int] = []
-    val_idx: List[int] = []
-    for i, (iid, _, _) in enumerate(dataset.samples):
-        if iid in val_set:
-            val_idx.append(i)
-        else:
-            train_idx.append(i)
+        def __len__(self):
+            return len(self.indices)
 
-    if len(train_idx) == 0:
-        # ensure non-empty train
-        train_idx = val_idx[:-1]
-        val_idx = val_idx[-1:]
+        def __getitem__(self, i):
+            return self.ds[self.indices[i]]
 
-    return Subset(dataset, train_idx), Subset(dataset, val_idx)
+    if n_val == 0:
+        return _Subset(dataset, train_idxs), None
+    return _Subset(dataset, train_idxs), _Subset(dataset, list(val_idxs))
 
 
 # ---------------------------------------------------------------------------
 # Collate
 # ---------------------------------------------------------------------------
-
 def collate_graph_text(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     from torch_geometric.data import Batch as GeoBatch
 
@@ -202,13 +178,12 @@ def collate_graph_text(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Tokenization
 # ---------------------------------------------------------------------------
-
 def build_chat_inputs_and_labels(
     tokenizer: Any,
     prompts: List[str],
     answers: List[str],
     device: torch.device,
-    max_length: int = 256,
+    max_length: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     use_chat = hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None
 
@@ -235,7 +210,6 @@ def build_chat_inputs_and_labels(
 
             labels = full_ids.clone()
             labels[:prompt_len] = -100
-
             attn = full.get("attention_mask", torch.ones_like(full_ids))
             if attn.dim() > 1:
                 attn = attn[0]
@@ -259,20 +233,13 @@ def build_chat_inputs_and_labels(
 
 
 # ---------------------------------------------------------------------------
-# LightningModule (Stage2-A)
+# LightningModule: Stage2-B only
 # ---------------------------------------------------------------------------
-
-class ProjectorPL(pl.LightningModule):
+class Stage2BProjectorPL(pl.LightningModule):
     """
-    Stage2-A:
-      Train:
-        - vg_adapter
-        - gl_projector
-      Freeze:
-        - graph_qformer (explicit)
-        - LLM
-        - graphgpt
-        - vision (disabled)
+    Stage2-B:
+      train: vg_adapter + gl_projector + graph_qformer
+      freeze: LLM + graphgpt (+ vision)
     """
 
     def __init__(
@@ -282,7 +249,7 @@ class ProjectorPL(pl.LightningModule):
         lr: float,
         max_length: int,
         auto_resize_token_embeddings: bool = True,
-    ) -> None:
+    ):
         super().__init__()
         self.save_hyperparameters()
 
@@ -292,15 +259,14 @@ class ProjectorPL(pl.LightningModule):
             enable_vision=False,
         )
 
-        # Stage2-A trainable selection
+        # trainable params (Stage2-B)
         for name, p in self.model.named_parameters():
-            trainable = ("vg_adapter" in name) or ("gl_projector" in name)
-            # graph_qformer must be frozen in stage2A
-            if "graph_qformer" in name:
-                trainable = False
-            p.requires_grad = bool(trainable)
+            if ("vg_adapter" in name) or ("gl_projector" in name) or ("graph_qformer" in name):
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
 
-        # LLM memory-saving settings
+        # LLM config
         if hasattr(self.model.llm.model, "gradient_checkpointing_enable"):
             self.model.llm.model.gradient_checkpointing_enable()
         if hasattr(self.model.llm.model, "config"):
@@ -320,9 +286,9 @@ class ProjectorPL(pl.LightningModule):
 
     def configure_optimizers(self):
         params = [p for p in self.model.parameters() if p.requires_grad]
-        return AdamW(params, lr=float(self.hparams.lr))
+        return AdamW(params, lr=self.hparams.lr)
 
-    def _forward_and_loss(self, batch: Dict[str, Any]) -> torch.Tensor:
+    def training_step(self, batch: Dict[str, Any], batch_idx: int):
         graph_data = batch["graph_data"].to(self.device)
         prompts: List[str] = batch["text"]
         answers: List[str] = batch["answer"]
@@ -361,85 +327,105 @@ class ProjectorPL(pl.LightningModule):
                     )
                 else:
                     loss = torch.tensor(0.0, device=self.device)
-            else:
-                loss = torch.tensor(0.0, device=self.device)
-        return loss
 
-    def training_step(self, batch: Dict[str, Any], batch_idx: int):
-        loss = self._forward_and_loss(batch)
-        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=len(batch["text"]))
+        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=len(prompts))
         return loss
 
     def validation_step(self, batch: Dict[str, Any], batch_idx: int):
-        loss = self._forward_and_loss(batch)
-        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=len(batch["text"]))
+        graph_data = batch["graph_data"].to(self.device)
+        prompts: List[str] = batch["text"]
+        answers: List[str] = batch["answer"]
+
+        input_ids, attention_mask, labels = build_chat_inputs_and_labels(
+            tokenizer=self.tokenizer,
+            prompts=prompts,
+            answers=answers,
+            device=self.device,
+            max_length=self.max_length,
+        )
+
+        outputs = self.model(
+            graph_data=graph_data,
+            pixel_values=None,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            return_debug=False,
+        )
+
+        loss = outputs.loss
+        if loss is None or torch.isnan(loss) or torch.isinf(loss):
+            logits = getattr(outputs, "logits", None)
+            if logits is not None:
+                shift_logits = logits[:, :-1, :].float().contiguous()
+                shift_labels = labels[:, 1:].contiguous()
+                min_len = min(shift_logits.size(1), shift_labels.size(1))
+                shift_logits = shift_logits[:, :min_len, :]
+                shift_labels = shift_labels[:, :min_len]
+                if (shift_labels != -100).any():
+                    loss = F.cross_entropy(
+                        shift_logits.reshape(-1, shift_logits.size(-1)),
+                        shift_labels.reshape(-1),
+                        ignore_index=-100,
+                    )
+                else:
+                    loss = torch.tensor(0.0, device=self.device)
+
+        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=len(prompts))
         return loss
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Load stage2-A weights only (no optimizer restore)
 # ---------------------------------------------------------------------------
-
-def _parse_val_check_interval(x: float) -> float | int:
-    """
-    Lightning accepts:
-      - int: validate every N train steps
-      - float in (0,1]: fraction of epoch
-    """
-    x = float(x)
-    if x >= 1.0:
-        return int(x)
-    if x <= 0.0:
-        return 1.0
-    return x
+def load_stage2A_weights_only(pl_model: Stage2BProjectorPL, ckpt_path: str):
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    sd = ckpt.get("state_dict", ckpt)  # lightning ckpt uses "state_dict"
+    # strip "model." prefix -> match OmniGraphModel keys
+    if any(k.startswith("model.") for k in sd.keys()):
+        sd = {k.replace("model.", "", 1): v for k, v in sd.items() if k.startswith("model.")}
+    missing, unexpected = pl_model.model.load_state_dict(sd, strict=False)
+    print(f"[Stage2B] loaded weights-only from: {ckpt_path}")
+    print(f"[Stage2B] missing={len(missing)} unexpected={len(unexpected)}")
+    if missing:
+        print("  missing head:", missing[:20])
+    if unexpected:
+        print("  unexpected head:", unexpected[:20])
 
 
 # ---------------------------------------------------------------------------
-# Entry (Stage2-A only)
+# Entry
 # ---------------------------------------------------------------------------
-
 def main():
     ap = argparse.ArgumentParser()
-
     ap.add_argument("--scene_graphs", type=str, required=True)
-    ap.add_argument("--regions", type=str, required=True, help="VG region descriptions json")
-
+    ap.add_argument("--regions", type=str, required=True)
+    ap.add_argument("--stage2A_ckpt", type=str, required=True, help="best ckpt from stage2-A (weights init)")
     ap.add_argument("--llm", type=str, default="Qwen/Qwen2.5-7B-Instruct")
     ap.add_argument("--graph_model", type=str, default="clip_gt_arxiv_pub")
 
-    ap.add_argument("--gpu", type=int, default=0, help="GPU index; use -1 for CPU")
+    ap.add_argument("--gpu", type=int, default=0, help="gpu index; -1 for cpu")
     ap.add_argument("--batch_size", type=int, default=2)
-    ap.add_argument("--num_workers", type=int, default=4)
-
-    ap.add_argument("--precision", type=int, default=32)
+    ap.add_argument("--lr", type=float, default=2e-5)
+    ap.add_argument("--max_steps", type=int, default=20000)
     ap.add_argument("--max_length", type=int, default=256)
+    ap.add_argument("--num_workers", type=int, default=4)
+    ap.add_argument("--precision", type=int, default=32)
 
+    ap.add_argument("--save_dir", type=str, default="checkpoints_stage2B")
     ap.add_argument("--min_freq", type=int, default=2)
     ap.add_argument("--max_nodes", type=int, default=80)
     ap.add_argument("--max_attrs", type=int, default=6)
 
-    ap.add_argument("--val_ratio", type=float, default=0.001, help="split by image_id")
-    ap.add_argument("--seed", type=int, default=42)
-
+    ap.add_argument("--val_ratio", type=float, default=0.001)
     ap.add_argument("--patience", type=int, default=2)
     ap.add_argument("--min_delta", type=float, default=0.01)
-
-    ap.add_argument("--val_check_interval", type=float, default=2000, help=">=1: every N steps; (0,1]: fraction epoch")
-    ap.add_argument("--limit_val_batches", type=float, default=1.0)
-
-    # Stage2-A hyperparams
-    ap.add_argument("--lr", type=float, default=5e-5)
-    ap.add_argument("--max_steps", type=int, default=80000)
-
-    ap.add_argument("--save_dir", type=str, default="checkpoints_projector_vg/stage2A")
-
+    ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
-    pl.seed_everything(int(args.seed), workers=True)
 
-    save_dir = Path(args.save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
+    pl.seed_everything(args.seed, workers=True)
 
-    # 1) build vocabs -> NUM_OBJ/NUM_ATTR (OmniGraphModel depends on module globals)
+    # 1) build vocabs -> NUM_OBJ/NUM_ATTR
     obj_vocab, pred_vocab, attr_vocab = build_vg_vocabs_from_file(args.scene_graphs, min_freq=args.min_freq)
     num_obj = len(obj_vocab.stoi)
     num_attr = len(attr_vocab.stoi)
@@ -459,103 +445,88 @@ def main():
         use_bbox_max_norm=True,
     )
 
-    # 3) region pairs -> joined dataset
+    # 3) region phrases dataset
     region_pairs = load_region_pairs(args.regions)
-    print(f"[Regions] loaded pairs={len(region_pairs)} from {args.regions}")
+    full_dataset = VGGraphRegionTextDataset(sg_dataset=sg_dataset, region_pairs=region_pairs, prompt="Describe the region.")
 
-    full_dataset = VGGraphRegionTextDataset(
-        sg_dataset=sg_dataset,
-        region_pairs=region_pairs,
-        prompt="Describe the region.",
-    )
-    print(f"[Join] usable_pairs={len(full_dataset)}")
-    if len(full_dataset) == 0:
-        raise RuntimeError("No usable (scene graph, region phrase) pairs after join. Check image_id alignment.")
-
-    # 4) split train/val by image_id
-    train_ds, val_ds = split_by_image_id(full_dataset, val_ratio=float(args.val_ratio), seed=int(args.seed))
-    print(f"[Split] train={len(train_ds)} val={len(val_ds)} (val_ratio={args.val_ratio})")
+    train_ds, val_ds = split_train_val(full_dataset, val_ratio=args.val_ratio, seed=args.seed)
 
     train_loader = DataLoader(
         train_ds,
-        batch_size=int(args.batch_size),
+        batch_size=args.batch_size,
         shuffle=True,
-        num_workers=int(args.num_workers),
+        num_workers=args.num_workers,
         pin_memory=True,
         collate_fn=collate_graph_text,
-        persistent_workers=(int(args.num_workers) > 0),
     )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=int(args.batch_size),
-        shuffle=False,
-        num_workers=int(args.num_workers),
-        pin_memory=True,
-        collate_fn=collate_graph_text,
-        persistent_workers=(int(args.num_workers) > 0),
-    )
+    val_loader = None
+    if val_ds is not None:
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=collate_graph_text,
+        )
 
-    vci = _parse_val_check_interval(args.val_check_interval)
-
-    # 5) model + callbacks
-    pl_model = ProjectorPL(
+    # 4) stage2-B model
+    pl_model = Stage2BProjectorPL(
         llm_model_name=args.llm,
         graph_model_name=args.graph_model,
-        lr=float(args.lr),
-        max_length=int(args.max_length),
+        lr=args.lr,
+        max_length=args.max_length,
         auto_resize_token_embeddings=True,
     )
 
-    ckpt_cb = ModelCheckpoint(
+    # 5) init from stage2-A (weights only)
+    load_stage2A_weights_only(pl_model, args.stage2A_ckpt)
+
+    # 6) callbacks
+    save_dir = Path(args.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    ckpt = ModelCheckpoint(
         dirpath=str(save_dir),
-        filename="stage2A-step={step:07d}-val_loss={val_loss:.3f}",
+        filename="stage2B-step={step:07d}-val_loss={val_loss:.3f}",
         save_top_k=1,
-        monitor="val_loss",
+        monitor="val_loss" if val_loader is not None else "train_loss",
         mode="min",
         save_last=True,
     )
     lr_monitor = LearningRateMonitor(logging_interval="step")
-    es = EarlyStopping(
-        monitor="val_loss",
+    early = EarlyStopping(
+        monitor="val_loss" if val_loader is not None else "train_loss",
         mode="min",
-        patience=int(args.patience),
-        min_delta=float(args.min_delta),
-        verbose=True,
+        patience=args.patience,
+        min_delta=args.min_delta,
     )
 
-    use_gpu = torch.cuda.is_available() and int(args.gpu) >= 0
+    use_gpu = torch.cuda.is_available() and args.gpu >= 0
     devices = [int(args.gpu)] if use_gpu else 1
-    if use_gpu:
-        if int(args.gpu) >= torch.cuda.device_count():
-            raise ValueError(f"--gpu={args.gpu} out of range (device_count={torch.cuda.device_count()}).")
-        torch.cuda.set_device(int(args.gpu))
+    if use_gpu and int(args.gpu) >= torch.cuda.device_count():
+        raise ValueError(f"--gpu={args.gpu} out of range (count={torch.cuda.device_count()})")
 
     trainer = pl.Trainer(
         accelerator="gpu" if use_gpu else "cpu",
         devices=devices,
-        precision=int(args.precision),
-        max_steps=int(args.max_steps),
-        max_epochs=999999,
-        callbacks=[ckpt_cb, lr_monitor, es],
+        precision=args.precision,
+        max_steps=args.max_steps,
+        max_epochs=999999,  # max_steps 控制
+        callbacks=[ckpt, lr_monitor, early],
         log_every_n_steps=10,
         gradient_clip_val=1.0,
         accumulate_grad_batches=4,
-        check_val_every_n_epoch=1,
-        val_check_interval=vci,
-        limit_val_batches=float(args.limit_val_batches),
-        enable_checkpointing=True,
+        val_check_interval=2000 if val_loader is not None else None,  # 让 val 更早发生；不想频繁可改大
+        check_val_every_n_epoch=None if val_loader is not None else 1,
     )
 
-    trainer.fit(pl_model, train_loader, val_loader)
+    trainer.fit(pl_model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
-    best_path = ckpt_cb.best_model_path or ""
-    export_path = save_dir / "model_state_dict.pt"
-    torch.save(pl_model.model.state_dict(), str(export_path))
-    print(f"[stage2A] exported state_dict -> {export_path}")
-    if best_path:
-        print(f"[stage2A] best ckpt -> {best_path}")
-    else:
-        print("[stage2A] warning: best ckpt not found (check monitor='val_loss' and val loader).")
+    # 7) export pure weights (OmniGraphModel)
+    out_pt = save_dir / "stage2B_model_state_dict.pt"
+    torch.save(pl_model.model.state_dict(), str(out_pt))
+    print(f"[Saved] weights -> {out_pt}")
 
 
 if __name__ == "__main__":
