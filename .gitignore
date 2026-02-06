@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+.env
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
+lightning_logs/
+
+# Checkpoints and weights
+checkpoints_stage1/
+checkpoints_projector/
+*.ckpt
+*.pt
+
+# Data artifacts
+/data/
+
+# Misc
+*.tmp
+*.swp
+
+GraphGPT/
+.github/
+.trae/

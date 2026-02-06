@@ -1,0 +1,14 @@
+torch==2.3.1+cu121
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+transformers>=4.44.0
+accelerate>=0.31.0
+tokenizers>=0.19.1
+
+torch-geometric>=2.5.3
+numpy>=1.26.4
+
+tqdm
+networkx>=3.1
+jsonpatch
+pyyaml
