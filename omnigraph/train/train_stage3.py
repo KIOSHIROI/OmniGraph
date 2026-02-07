@@ -108,13 +108,30 @@ def find_image_path(image_root: str, image_id: int) -> Optional[str]:
     VG images are commonly stored as {image_id}.jpg under VG_100K / VG_100K_2.
     This tries several common layouts.
     """
+    root = Path(image_root)
+    alt_root = root / "contents" / "images"
+    img_root = root / "images"
+
     candidates = [
-        Path(image_root) / f"{image_id}.jpg",
-        Path(image_root) / f"{image_id}.png",
-        Path(image_root) / "VG_100K" / f"{image_id}.jpg",
-        Path(image_root) / "VG_100K" / f"{image_id}.png",
-        Path(image_root) / "VG_100K_2" / f"{image_id}.jpg",
-        Path(image_root) / "VG_100K_2" / f"{image_id}.png",
+        root / f"{image_id}.jpg",
+        root / f"{image_id}.png",
+        img_root / f"{image_id}.jpg",
+        img_root / f"{image_id}.png",
+        root / "VG_100K" / f"{image_id}.jpg",
+        root / "VG_100K" / f"{image_id}.png",
+        root / "VG_100K_2" / f"{image_id}.jpg",
+        root / "VG_100K_2" / f"{image_id}.png",
+        img_root / "VG_100K" / f"{image_id}.jpg",
+        img_root / "VG_100K" / f"{image_id}.png",
+        img_root / "VG_100K_2" / f"{image_id}.jpg",
+        img_root / "VG_100K_2" / f"{image_id}.png",
+        # common in this repo: data/vg/contents/images
+        alt_root / f"{image_id}.jpg",
+        alt_root / f"{image_id}.png",
+        alt_root / "VG_100K" / f"{image_id}.jpg",
+        alt_root / "VG_100K" / f"{image_id}.png",
+        alt_root / "VG_100K_2" / f"{image_id}.jpg",
+        alt_root / "VG_100K_2" / f"{image_id}.png",
     ]
     for p in candidates:
         if p.exists():
@@ -350,6 +367,20 @@ def load_weights_only_into_model(model: OmniGraphModel, init_path: str) -> None:
         raise FileNotFoundError(f"--init_ckpt not found: {init_path}")
 
     obj = torch.load(str(p), map_location="cpu")
+    def _filter_mismatched(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        model_sd = model.state_dict()
+        filtered: Dict[str, torch.Tensor] = {}
+        skipped = []
+        for k, v in sd.items():
+            if k in model_sd and hasattr(v, "shape") and hasattr(model_sd[k], "shape"):
+                if v.shape != model_sd[k].shape:
+                    skipped.append((k, tuple(v.shape), tuple(model_sd[k].shape)))
+                    continue
+            filtered[k] = v
+        if skipped:
+            print(f"[Init] Skipped {len(skipped)} mismatched keys (e.g., {skipped[0][0]} {skipped[0][1]} -> {skipped[0][2]}).")
+        return filtered
+
     if isinstance(obj, dict) and "state_dict" in obj:
         # Lightning checkpoint
         sd = obj["state_dict"]
@@ -360,9 +391,11 @@ def load_weights_only_into_model(model: OmniGraphModel, init_path: str) -> None:
                 new_sd[k[len("model."):]] = v
             else:
                 new_sd[k] = v
+        new_sd = _filter_mismatched(new_sd)
         missing, unexpected = model.load_state_dict(new_sd, strict=False)
         print(f"[Init] Loaded from ckpt (weights-only). missing={len(missing)} unexpected={len(unexpected)}")
     elif isinstance(obj, dict):
+        obj = _filter_mismatched(obj)
         missing, unexpected = model.load_state_dict(obj, strict=False)
         print(f"[Init] Loaded from state_dict. missing={len(missing)} unexpected={len(unexpected)}")
     else:
