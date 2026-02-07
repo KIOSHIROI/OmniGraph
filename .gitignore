@@ -37,3 +37,6 @@ checkpoints_projector/
 GraphGPT/
 .github/
 .trae/
+
+gpu_watch/gpu_watch.py
+gpu_watch.sh
