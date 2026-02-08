@@ -38,5 +38,7 @@ GraphGPT/
 .github/
 .trae/
 
-gpu_watch/gpu_watch.py
+gpu_watch
 gpu_watch.sh
+
+output.txt

@@ -272,8 +272,56 @@ def collate_tri(batch: List[Dict[str, Any]], processor: Any) -> Dict[str, Any]:
     graphs = [b["graph_data"] for b in batch]
     batch_graph = GeoBatch.from_data_list(graphs)
 
-    pil_images = [b["pil_image"] for b in batch]
-    pixel_values = processor(images=pil_images, return_tensors="pt")["pixel_values"]
+    from PIL import Image
+    import numpy as np
+    import torch
+
+    def _ensure_pil(img: Any) -> Image.Image:
+        try:
+            if isinstance(img, Image.Image):
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                if img.size[0] < 1 or img.size[1] < 1:
+                    return Image.new("RGB", (224, 224), (0, 0, 0))
+                return img
+
+            if torch.is_tensor(img):
+                img = img.detach().cpu().numpy()
+
+            if isinstance(img, np.ndarray):
+                if img.ndim == 2:
+                    img = np.stack([img] * 3, axis=-1)
+                elif img.ndim == 3:
+                    # try channel-last first
+                    if img.shape[-1] not in (1, 3, 4) and img.shape[0] in (1, 3, 4):
+                        img = np.transpose(img, (1, 2, 0))
+                    if img.shape[-1] == 1:
+                        img = np.repeat(img, 3, axis=-1)
+                    elif img.shape[-1] > 4:
+                        img = img[..., :3]
+                else:
+                    return Image.new("RGB", (224, 224), (0, 0, 0))
+
+                return Image.fromarray(img.astype("uint8"), mode="RGB")
+        except Exception:
+            return Image.new("RGB", (224, 224), (0, 0, 0))
+
+        return Image.new("RGB", (224, 224), (0, 0, 0))
+
+    pil_images = [_ensure_pil(b["pil_image"]) for b in batch]
+
+    safe_image = Image.new("RGB", (224, 224), (0, 0, 0))
+    try:
+        pixel_values = processor(images=pil_images, return_tensors="pt")["pixel_values"]
+    except Exception:
+        pixel_values_list = []
+        for img in pil_images:
+            try:
+                pv = processor(images=img, return_tensors="pt")["pixel_values"][0]
+            except Exception:
+                pv = processor(images=safe_image, return_tensors="pt")["pixel_values"][0]
+            pixel_values_list.append(pv)
+        pixel_values = torch.stack(pixel_values_list, dim=0)
 
     prompts = [b["prompt"] for b in batch]
     answers = [b["answer"] for b in batch]
