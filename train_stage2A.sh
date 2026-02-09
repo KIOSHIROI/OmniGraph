@@ -1,15 +1,26 @@
-# Paper-sprint profile (VG-only, stronger GQA-like transfer):
-# - larger val split for more stable early-stop signal
-# - less aggressive early stop (patience up, min_delta down)
-# - stronger synthetic graph-QA mixing
-# - single RTX 4090 optimized: fp16 + moderate batch size
-python omnigraph/train/train_projector.py \
-  --scene_graphs data/vg/contents/sceneGraphs/scene_graphs.json \
-  --regions data/vg/contents/regionDescriptions/region_descriptions.json \
-  --stage1_qformer_ckpt graph_qformer_stage1.pt \
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Stage2A paper-sprint profile (VG-only, stronger GQA-like transfer)
+
+WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$WORKDIR"
+
+PYTHON_BIN=${PYTHON_BIN:-python}
+GPU=${GPU:-0}
+
+SCENE_GRAPHS=${SCENE_GRAPHS:-data/vg/contents/sceneGraphs/scene_graphs.json}
+REGIONS=${REGIONS:-data/vg/contents/regionDescriptions/region_descriptions.json}
+STAGE1_CKPT=${STAGE1_CKPT:-graph_qformer_stage1.pt}
+SAVE_DIR=${SAVE_DIR:-checkpoints_projector_vg/stage2A_paper}
+
+"$PYTHON_BIN" omnigraph/train/train_projector.py \
+  --scene_graphs "$SCENE_GRAPHS" \
+  --regions "$REGIONS" \
+  --stage1_qformer_ckpt "$STAGE1_CKPT" \
   --graph_qa_max_per_image 5 \
   --graph_qa_repeat 3 \
-  --gpu 0 \
+  --gpu "$GPU" \
   --batch_size 3 \
   --precision 16 \
   --max_length 256 \
@@ -20,4 +31,4 @@ python omnigraph/train/train_projector.py \
   --lr 3e-5 \
   --max_steps 120000 \
   --val_check_interval 1000 \
-  --save_dir checkpoints_projector_vg/stage2A_paper
+  --save_dir "$SAVE_DIR"
