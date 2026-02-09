@@ -42,3 +42,5 @@ gpu_watch
 gpu_watch.sh
 
 output.txt
+# Large model artifacts
+omnigraph/model/graph/clip_gt_arxiv_pub/clip_gt_arxiv_pub.pkl
