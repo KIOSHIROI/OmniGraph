@@ -11,6 +11,14 @@ cd "$WORKDIR"
 PYTHON_BIN=${PYTHON_BIN:-python}
 REPO=${REPO:-"$WORKDIR"}
 GPU=${GPU:-0}
+ISOLATE_GPU=${ISOLATE_GPU:-1}
+ORIG_GPU=${GPU}
+if [ "$ISOLATE_GPU" = "1" ]; then
+  export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-$GPU}
+  GPU=0
+fi
+PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+export PYTORCH_CUDA_ALLOC_CONF
 
 STRICT_TARGET=${STRICT_TARGET:-0.4200}
 STRICT_SPRINT_TARGET=${STRICT_SPRINT_TARGET:-0.4400}
@@ -18,6 +26,63 @@ STRICT_BASELINE=${STRICT_BASELINE:-0.3912}
 COVERAGE_TARGET=${COVERAGE_TARGET:-0.9990}
 RUN_ROUND2_ON_FAIL=${RUN_ROUND2_ON_FAIL:-1}
 INSTALL_DEPS=${INSTALL_DEPS:-0}
+LOW_VRAM_4090=${LOW_VRAM_4090:-1}
+
+LLM_MODEL=${LLM_MODEL:-Qwen/Qwen2.5-7B-Instruct}
+VISION_MODEL=${VISION_MODEL:-Salesforce/blip2-flan-t5-xl}
+
+if [ "$LOW_VRAM_4090" = "1" ]; then
+  # Conservative profile for RTX 4090 24GB.
+  : "${S2A_BATCH_SIZE:=1}"
+  : "${S2A_MAX_LENGTH:=192}"
+  : "${S2A_NUM_WORKERS:=4}"
+  : "${S2A_PRECISION:=16}"
+
+  : "${S2B_BATCH_SIZE:=1}"
+  : "${S2B_MAX_LENGTH:=192}"
+  : "${S2B_NUM_WORKERS:=4}"
+  : "${S2B_PRECISION:=16}"
+
+  : "${S3_BATCH_SIZE:=1}"
+  : "${S3_MAX_LENGTH:=160}"
+  : "${S3_NUM_WORKERS:=2}"
+  : "${S3_PRECISION:=16}"
+
+  : "${S2B_R2_BATCH_SIZE:=1}"
+  : "${S2B_R2_MAX_LENGTH:=192}"
+  : "${S2B_R2_NUM_WORKERS:=4}"
+  : "${S2B_R2_PRECISION:=16}"
+
+  : "${S3_R2_BATCH_SIZE:=1}"
+  : "${S3_R2_MAX_LENGTH:=160}"
+  : "${S3_R2_NUM_WORKERS:=2}"
+  : "${S3_R2_PRECISION:=16}"
+else
+  : "${S2A_BATCH_SIZE:=3}"
+  : "${S2A_MAX_LENGTH:=256}"
+  : "${S2A_NUM_WORKERS:=8}"
+  : "${S2A_PRECISION:=16}"
+
+  : "${S2B_BATCH_SIZE:=3}"
+  : "${S2B_MAX_LENGTH:=256}"
+  : "${S2B_NUM_WORKERS:=8}"
+  : "${S2B_PRECISION:=16}"
+
+  : "${S3_BATCH_SIZE:=2}"
+  : "${S3_MAX_LENGTH:=256}"
+  : "${S3_NUM_WORKERS:=4}"
+  : "${S3_PRECISION:=16}"
+
+  : "${S2B_R2_BATCH_SIZE:=3}"
+  : "${S2B_R2_MAX_LENGTH:=256}"
+  : "${S2B_R2_NUM_WORKERS:=8}"
+  : "${S2B_R2_PRECISION:=16}"
+
+  : "${S3_R2_BATCH_SIZE:=2}"
+  : "${S3_R2_MAX_LENGTH:=256}"
+  : "${S3_R2_NUM_WORKERS:=4}"
+  : "${S3_R2_PRECISION:=16}"
+fi
 
 VG_SCENE_GRAPHS=${VG_SCENE_GRAPHS:-"$REPO/data/vg/contents/sceneGraphs/scene_graphs.json"}
 VG_REGIONS=${VG_REGIONS:-"$REPO/data/vg/contents/regionDescriptions/region_descriptions.json"}
@@ -43,6 +108,7 @@ GQA_EVAL_R2=${GQA_EVAL_R2:-"$REPO/data/gqa/eval_val_balanced_round2.txt"}
 SELECT_CKPT="${REPO}/scripts/train/select_best_ckpt.py"
 
 echo "[Precheck] repo=${REPO}"
+echo "[Precheck] GPU request=${ORIG_GPU} isolate=${ISOLATE_GPU} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset} internal_gpu=${GPU}"
 if ! "$PYTHON_BIN" -c "import torch, pytorch_lightning as pl" >/dev/null 2>&1; then
   if [ "$INSTALL_DEPS" = "1" ]; then
     echo "[Precheck] missing deps -> installing from requirements.txt"
@@ -53,6 +119,10 @@ if ! "$PYTHON_BIN" -c "import torch, pytorch_lightning as pl" >/dev/null 2>&1; t
   fi
 fi
 "$PYTHON_BIN" -c "import torch, pytorch_lightning as pl; print('torch', torch.__version__); print('cuda', torch.cuda.is_available()); print('gpu', torch.cuda.get_device_name(${GPU}) if torch.cuda.is_available() else 'cpu')"
+echo "[Config] LOW_VRAM_4090=${LOW_VRAM_4090} LLM_MODEL=${LLM_MODEL} VISION_MODEL=${VISION_MODEL}"
+echo "[Config] S2A bs=${S2A_BATCH_SIZE} max_len=${S2A_MAX_LENGTH} workers=${S2A_NUM_WORKERS} prec=${S2A_PRECISION}"
+echo "[Config] S2B bs=${S2B_BATCH_SIZE} max_len=${S2B_MAX_LENGTH} workers=${S2B_NUM_WORKERS} prec=${S2B_PRECISION}"
+echo "[Config] S3  bs=${S3_BATCH_SIZE} max_len=${S3_MAX_LENGTH} workers=${S3_NUM_WORKERS} prec=${S3_PRECISION}"
 test -f "$STAGE1_QFORMER_CKPT"
 test -f "$VG_SCENE_GRAPHS"
 test -f "$VG_REGIONS"
@@ -65,13 +135,14 @@ echo "[Stage2A] start"
   --scene_graphs "$VG_SCENE_GRAPHS" \
   --regions "$VG_REGIONS" \
   --stage1_qformer_ckpt "$STAGE1_QFORMER_CKPT" \
+  --llm "$LLM_MODEL" \
   --graph_qa_max_per_image 5 \
   --graph_qa_repeat 3 \
   --gpu "$GPU" \
-  --batch_size 3 \
-  --precision 16 \
-  --max_length 256 \
-  --num_workers 8 \
+  --batch_size "$S2A_BATCH_SIZE" \
+  --precision "$S2A_PRECISION" \
+  --max_length "$S2A_MAX_LENGTH" \
+  --num_workers "$S2A_NUM_WORKERS" \
   --val_ratio 0.02 \
   --patience 16 \
   --min_delta 0.0005 \
@@ -91,12 +162,14 @@ echo "[Stage2B] start"
   --scene_graphs "$VG_SCENE_GRAPHS" \
   --regions "$VG_REGIONS" \
   --stage2A_ckpt "$STAGE2A_CKPT" \
+  --llm "$LLM_MODEL" \
   --graph_qa_max_per_image 6 \
   --graph_qa_repeat 4 \
   --gpu "$GPU" \
-  --batch_size 3 \
-  --precision 16 \
-  --max_length 256 \
+  --batch_size "$S2B_BATCH_SIZE" \
+  --precision "$S2B_PRECISION" \
+  --max_length "$S2B_MAX_LENGTH" \
+  --num_workers "$S2B_NUM_WORKERS" \
   --lr 1.2e-5 \
   --max_steps 60000 \
   --val_ratio 0.02 \
@@ -117,12 +190,15 @@ echo "[Stage3] start"
   --regions "$VG_REGIONS" \
   --image_root "$VG_IMAGE_ROOT" \
   --stage2B_ckpt "$STAGE2B_CKPT" \
+  --llm "$LLM_MODEL" \
+  --vision "$VISION_MODEL" \
   --graph_qa_max_per_image 4 \
   --graph_qa_repeat 2 \
   --gpu "$GPU" \
-  --batch_size 2 \
-  --precision 16 \
-  --max_length 256 \
+  --batch_size "$S3_BATCH_SIZE" \
+  --precision "$S3_PRECISION" \
+  --max_length "$S3_MAX_LENGTH" \
+  --num_workers "$S3_NUM_WORKERS" \
   --lr 2e-5 \
   --max_steps 50000 \
   --val_ratio 0.02 \
@@ -151,6 +227,8 @@ echo "[GQA] infer paper run"
   --scene_graphs "$GQA_SCENE_VG" \
   --image_root "$GQA_IMAGE_ROOT" \
   --ckpt "$STAGE3_DIR/omnigraph_stage3_state_dict.pt" \
+  --llm "$LLM_MODEL" \
+  --vision "$VISION_MODEL" \
   --output "$GQA_PRED_PAPER" \
   --batch_size 1 \
   --max_length 128 \
@@ -229,12 +307,14 @@ echo "[Round2] strict below target, start fixed round-2 recipe."
   --scene_graphs "$VG_SCENE_GRAPHS" \
   --regions "$VG_REGIONS" \
   --stage2A_ckpt "$STAGE2A_CKPT" \
+  --llm "$LLM_MODEL" \
   --graph_qa_max_per_image 8 \
   --graph_qa_repeat 5 \
   --gpu "$GPU" \
-  --batch_size 3 \
-  --precision 16 \
-  --max_length 256 \
+  --batch_size "$S2B_R2_BATCH_SIZE" \
+  --precision "$S2B_R2_PRECISION" \
+  --max_length "$S2B_R2_MAX_LENGTH" \
+  --num_workers "$S2B_R2_NUM_WORKERS" \
   --lr 8e-6 \
   --max_steps 80000 \
   --val_ratio 0.02 \
@@ -254,12 +334,15 @@ test -f "$STAGE2B_R2_CKPT"
   --regions "$VG_REGIONS" \
   --image_root "$VG_IMAGE_ROOT" \
   --stage2B_ckpt "$STAGE2B_R2_CKPT" \
+  --llm "$LLM_MODEL" \
+  --vision "$VISION_MODEL" \
   --graph_qa_max_per_image 5 \
   --graph_qa_repeat 3 \
   --gpu "$GPU" \
-  --batch_size 2 \
-  --precision 16 \
-  --max_length 256 \
+  --batch_size "$S3_R2_BATCH_SIZE" \
+  --precision "$S3_R2_PRECISION" \
+  --max_length "$S3_R2_MAX_LENGTH" \
+  --num_workers "$S3_R2_NUM_WORKERS" \
   --lr 1.5e-5 \
   --max_steps 70000 \
   --val_ratio 0.02 \
@@ -273,6 +356,8 @@ test -f "$STAGE2B_R2_CKPT"
   --scene_graphs "$GQA_SCENE_VG" \
   --image_root "$GQA_IMAGE_ROOT" \
   --ckpt "$STAGE3_R2_DIR/omnigraph_stage3_state_dict.pt" \
+  --llm "$LLM_MODEL" \
+  --vision "$VISION_MODEL" \
   --output "$GQA_PRED_R2" \
   --batch_size 1 \
   --max_length 128 \
