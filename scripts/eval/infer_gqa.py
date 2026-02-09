@@ -18,7 +18,7 @@ from omnigraph.utils.env import setup_env  # noqa: E402
 setup_env()
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from transformers import AutoProcessor, AutoTokenizer
 
 from omnigraph.data.vg_scene_graph_dataset import VGSceneGraphDataset, build_vg_vocabs_from_file
@@ -201,6 +201,8 @@ def main() -> int:
     ap.add_argument("--max_nodes", type=int, default=80)
     ap.add_argument("--max_attrs", type=int, default=6)
     ap.add_argument("--disable_vision", action="store_true", help="disable vision branch at inference")
+    ap.add_argument("--max_samples", type=int, default=0, help="limit number of samples for quick eval")
+    ap.add_argument("--log_every", type=int, default=200, help="log progress every N samples")
     args = ap.parse_args()
 
     print("[Pipeline] GQA inference start (short-answer constrained decoding).")
@@ -229,6 +231,8 @@ def main() -> int:
         image_root=args.image_root,
         use_vision=use_vision,
     )
+    if int(args.max_samples) > 0:
+        dataset = Subset(dataset, list(range(min(int(args.max_samples), len(dataset)))))
     print(f"[Join] usable_questions={len(dataset)}")
     if len(dataset) == 0:
         raise RuntimeError("No usable GQA samples after joining questions/scene-graphs/images.")
@@ -259,15 +263,42 @@ def main() -> int:
         num_attr=int(num_attr),
     )
     sd = torch.load(args.ckpt, map_location="cpu")
-    model.load_state_dict(sd, strict=False)
+    model_sd = model.state_dict()
+    filtered = {}
+    skipped = 0
+    for k, v in sd.items():
+        if k in model_sd and hasattr(v, "shape") and hasattr(model_sd[k], "shape"):
+            if v.shape != model_sd[k].shape:
+                skipped += 1
+                continue
+        filtered[k] = v
+    if skipped:
+        print(f"[Init] Skipped {skipped} mismatched keys (vocab/adapter resize).")
+    model.load_state_dict(filtered, strict=False)
     model.to(device)
     model.eval()
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    try:
+        from tqdm import tqdm
+    except Exception:
+        tqdm = None
+
+    total = None
+    try:
+        total = len(dataset)
+    except Exception:
+        pass
+
+    iterator = loader
+    if tqdm is not None:
+        iterator = tqdm(loader, total=total, desc="Infer GQA")
+
     with out_path.open("w", encoding="utf-8") as f, torch.no_grad():
-        for batch in loader:
+        seen = 0
+        for batch in iterator:
             prompt_texts = [build_prompt_for_tokenizer(tokenizer, p) for p in batch["prompts"]]
             tok = tokenizer(
                 prompt_texts,
@@ -278,12 +309,46 @@ def main() -> int:
             )
             input_ids = tok["input_ids"].to(device)
             graph_data = batch["graph_data"].to(device)
+            # ensure graph_node for GraphCLIP-GT
+            if hasattr(graph_data, "obj_id") and hasattr(graph_data, "attr_id") and hasattr(graph_data, "bbox"):
+                try:
+                    graph_node = model.vg_adapter(graph_data.obj_id, graph_data.attr_id, graph_data.bbox)
+                    graph_data.graph_node = graph_node
+                    graph_data.x = graph_node
+                except Exception:
+                    pass
             pixel_values = batch["pixel_values"].to(device) if batch["pixel_values"] is not None else None
 
-            gen = model.generate(
-                input_ids=input_ids,
-                graph_data=graph_data,
-                pixel_values=pixel_values,
+            # build combined embeds manually to avoid RoPE length mismatch
+            inputs_embeds = model.llm.model.get_input_embeddings()(input_ids)
+            target_dtype = inputs_embeds.dtype
+            embeds_list = []
+
+            graph_embeds = None
+            if graph_data is not None:
+                graph_tokens = model.graph_branch(graph_data)
+                graph_embeds = model.gl_projector(graph_tokens)
+                if graph_embeds.dtype != target_dtype:
+                    graph_embeds = graph_embeds.to(target_dtype)
+                embeds_list.append(graph_embeds)
+
+            vision_embeds = None
+            if pixel_values is not None and model.vision_branch is not None and model.vl_projector is not None:
+                vision_tokens = model.vision_branch(pixel_values)
+                vision_embeds = model.vl_projector(vision_tokens)
+                if vision_embeds.dtype != target_dtype:
+                    vision_embeds = vision_embeds.to(target_dtype)
+                embeds_list.append(vision_embeds)
+
+            embeds_list.append(inputs_embeds)
+            combined_embeds = torch.cat(embeds_list, dim=1)
+            attention_mask = torch.ones(
+                combined_embeds.size(0), combined_embeds.size(1), dtype=torch.long, device=combined_embeds.device
+            )
+
+            gen = model.llm.generate(
+                inputs_embeds=combined_embeds,
+                attention_mask=attention_mask,
                 max_new_tokens=int(args.max_new_tokens),
                 do_sample=False,
             )
@@ -297,6 +362,10 @@ def main() -> int:
                     "image_id": batch["image_ids"][i],
                 }
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                seen += 1
+
+            if int(args.log_every) > 0 and seen % int(args.log_every) == 0:
+                print(f"Processed {seen} samples...")
 
     print(f"Wrote GQA predictions -> {out_path}")
     return 0
