@@ -9,7 +9,7 @@ from omnigraph.model.graph.builder import build_graph_tower
 from omnigraph.model.graph.graph_branch import GraphBranch
 from omnigraph.model.graph.graph_qformer import GraphQFormer, GraphQFormerConfig
 from omnigraph.model.vision.blip2_vision_qformer import BLIP2VisionQFormer
-from omnigraph.model.projector import Projector, ProjectorConfig
+from omnigraph.model.projector import Projector
 from omnigraph.model.llm.llama import LlamaLLM
 
 class OmniGraphModel(nn.Module):
@@ -23,10 +23,19 @@ class OmniGraphModel(nn.Module):
                  pretrained_graph_qformer=None,
                  use_blip2_vl_projector: bool = False,
                  blip2_vl_projector_trainable: bool = True,
-                 enable_vision: bool = True
+                 enable_vision: bool = True,
+                 num_obj: int | None = None,
+                 num_attr: int | None = None,
                  ):
         super().__init__()
-        self.vg_adapter = VGNodeAdapter(num_obj=NUM_OBJ, num_attr=NUM_ATTR, out_dim=128)
+        if num_obj is None or num_attr is None:
+            raise ValueError("OmniGraphModel requires explicit num_obj and num_attr.")
+        if int(num_obj) <= 0 or int(num_attr) <= 0:
+            raise ValueError(f"Invalid vocab sizes: num_obj={num_obj}, num_attr={num_attr}")
+
+        self.num_obj = int(num_obj)
+        self.num_attr = int(num_attr)
+        self.vg_adapter = VGNodeAdapter(num_obj=self.num_obj, num_attr=self.num_attr, out_dim=128)
         # 1. LLM (Frozen, bf16)
         print(f"Loading LLM: {llm_model_name}...")
         self.llm = LlamaLLM(model_name=llm_model_name, pretrained_model=pretrained_llm)

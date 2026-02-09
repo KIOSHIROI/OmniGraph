@@ -38,7 +38,6 @@ from omnigraph.data.vg_scene_graph_dataset import (  # noqa: E402
 )
 
 # Model
-import omnigraph.model.OmniGraphModel as omnigraph_model_module  # noqa: E402
 from omnigraph.model.OmniGraphModel import OmniGraphModel  # noqa: E402
 
 
@@ -399,55 +398,56 @@ def build_chat_inputs_and_labels(
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint loading: load weights only (no optimizer state)
+# Checkpoint loading: strict Stage2B ckpt only
 # ---------------------------------------------------------------------------
 
-def load_weights_only_into_model(model: OmniGraphModel, init_path: str) -> None:
-    """
-    Supports:
-      - .ckpt (Lightning): contains 'state_dict' with possible 'model.' prefix
-      - .pt / .bin (torch state_dict): directly loadable
-    """
-    if not init_path:
-        return
-    p = Path(init_path)
+def load_stage2b_weights_only_into_model(model: OmniGraphModel, stage2b_ckpt_path: str) -> Dict[str, Any]:
+    p = Path(stage2b_ckpt_path)
     if not p.exists():
-        raise FileNotFoundError(f"--init_ckpt not found: {init_path}")
+        raise FileNotFoundError(f"--stage2B_ckpt not found: {stage2b_ckpt_path}")
 
     obj = torch.load(str(p), map_location="cpu")
-    def _filter_mismatched(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        model_sd = model.state_dict()
-        filtered: Dict[str, torch.Tensor] = {}
-        skipped = []
-        for k, v in sd.items():
-            if k in model_sd and hasattr(v, "shape") and hasattr(model_sd[k], "shape"):
-                if v.shape != model_sd[k].shape:
-                    skipped.append((k, tuple(v.shape), tuple(model_sd[k].shape)))
-                    continue
-            filtered[k] = v
-        if skipped:
-            print(f"[Init] Skipped {len(skipped)} mismatched keys (e.g., {skipped[0][0]} {skipped[0][1]} -> {skipped[0][2]}).")
-        return filtered
+    if not isinstance(obj, dict) or "state_dict" not in obj:
+        raise RuntimeError("Stage3 requires a Stage2B Lightning checkpoint (.ckpt), not a raw state_dict.")
 
-    if isinstance(obj, dict) and "state_dict" in obj:
-        # Lightning checkpoint
-        sd = obj["state_dict"]
-        # strip possible "model." prefix
-        new_sd = {}
-        for k, v in sd.items():
-            if k.startswith("model."):
-                new_sd[k[len("model."):]] = v
-            else:
-                new_sd[k] = v
-        new_sd = _filter_mismatched(new_sd)
-        missing, unexpected = model.load_state_dict(new_sd, strict=False)
-        print(f"[Init] Loaded from ckpt (weights-only). missing={len(missing)} unexpected={len(unexpected)}")
-    elif isinstance(obj, dict):
-        obj = _filter_mismatched(obj)
-        missing, unexpected = model.load_state_dict(obj, strict=False)
-        print(f"[Init] Loaded from state_dict. missing={len(missing)} unexpected={len(unexpected)}")
-    else:
-        raise ValueError(f"Unsupported checkpoint format at: {init_path}")
+    hp = obj.get("hyper_parameters", {}) or {}
+    stage2a_ckpt = hp.get("stage2A_ckpt")
+    if not stage2a_ckpt:
+        raise RuntimeError(
+            "Stage2B checkpoint metadata missing 'stage2A_ckpt'. "
+            "Use Stage2B checkpoint generated from strict pipeline."
+        )
+
+    sd = obj["state_dict"]
+    new_sd = {}
+    for k, v in sd.items():
+        if k.startswith("model."):
+            new_sd[k[len("model."):]] = v
+        else:
+            new_sd[k] = v
+
+    # Keep strict pipeline robust against arch changes.
+    model_sd = model.state_dict()
+    filtered: Dict[str, torch.Tensor] = {}
+    skipped = []
+    for k, v in new_sd.items():
+        if k in model_sd and hasattr(v, "shape") and hasattr(model_sd[k], "shape") and v.shape != model_sd[k].shape:
+            skipped.append((k, tuple(v.shape), tuple(model_sd[k].shape)))
+            continue
+        filtered[k] = v
+    if skipped:
+        print(f"[Stage3] Skipped {len(skipped)} mismatched keys (example: {skipped[0][0]}).")
+
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
+    print(f"[Stage3] loaded weights-only from Stage2B ckpt: {p}")
+    print(f"[Stage3] missing={len(missing)} unexpected={len(unexpected)}")
+    print(f"[Stage3] Stage2B provenance: stage2A_ckpt={stage2a_ckpt}")
+    return {
+        "stage2B_ckpt": str(p),
+        "stage2A_ckpt": str(stage2a_ckpt),
+        "missing_keys": len(missing),
+        "unexpected_keys": len(unexpected),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -466,9 +466,11 @@ class Stage3PL(pl.LightningModule):
         llm_model_name: str,
         vision_model_name: str,
         graph_model_name: str,
+        num_obj: int,
+        num_attr: int,
         lr: float,
         max_length: int,
-        init_ckpt: str,
+        stage2B_ckpt: str,
         auto_resize_token_embeddings: bool = True,
     ):
         super().__init__()
@@ -479,11 +481,12 @@ class Stage3PL(pl.LightningModule):
             vision_model_name=vision_model_name,
             llm_model_name=llm_model_name,
             enable_vision=True,
+            num_obj=int(num_obj),
+            num_attr=int(num_attr),
         )
 
-        # load stage2 weights if provided (weights only)
-        if init_ckpt:
-            load_weights_only_into_model(self.model, init_ckpt)
+        # strict pipeline: Stage3 always initializes from Stage2B ckpt
+        self.stage2B_provenance = load_stage2b_weights_only_into_model(self.model, stage2B_ckpt)
 
         # Freeze everything except projectors
         for name, p in self.model.named_parameters():
@@ -590,7 +593,7 @@ def main():
     ap.add_argument("--vision", type=str, default="Salesforce/blip2-flan-t5-xl")
     ap.add_argument("--graph_model", type=str, default="clip_gt_arxiv_pub")
 
-    ap.add_argument("--init_ckpt", type=str, default="", help="stage2A ckpt (.ckpt) or model state_dict (.pt)")
+    ap.add_argument("--stage2B_ckpt", type=str, required=True, help="best ckpt from stage2-B (.ckpt)")
 
     ap.add_argument("--gpu", type=int, default=0)
     ap.add_argument("--batch_size", type=int, default=2)
@@ -621,16 +624,17 @@ def main():
 
     args = ap.parse_args()
     pl.seed_everything(int(args.seed), workers=True)
+    print("[Pipeline] Stage3 start: requires Stage2B .ckpt from strict pipeline.")
+    if not Path(args.stage2B_ckpt).exists():
+        raise FileNotFoundError(f"--stage2B_ckpt not found: {args.stage2B_ckpt}")
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) build vocabs -> NUM_OBJ/NUM_ATTR (OmniGraphModel depends on module globals)
+    # 1) build vocabs
     obj_vocab, pred_vocab, attr_vocab = build_vg_vocabs_from_file(args.scene_graphs, min_freq=int(args.min_freq))
     num_obj = len(obj_vocab.stoi)
     num_attr = len(attr_vocab.stoi)
-    omnigraph_model_module.NUM_OBJ = num_obj
-    omnigraph_model_module.NUM_ATTR = num_attr
     print(f"[Vocab] NUM_OBJ={num_obj} NUM_ATTR={num_attr}")
 
     # 2) scene graph dataset
@@ -696,9 +700,11 @@ def main():
         llm_model_name=args.llm,
         vision_model_name=args.vision,
         graph_model_name=args.graph_model,
+        num_obj=int(num_obj),
+        num_attr=int(num_attr),
         lr=float(args.lr),
         max_length=int(args.max_length),
-        init_ckpt=str(args.init_ckpt),
+        stage2B_ckpt=str(args.stage2B_ckpt),
         auto_resize_token_embeddings=True,
     )
 
@@ -749,6 +755,15 @@ def main():
     # Export clean OmniGraphModel state_dict (easy to load later)
     export_path = save_dir / "omnigraph_stage3_state_dict.pt"
     torch.save(pl_model.model.state_dict(), str(export_path))
+    stage_meta = {
+        "stage": "stage3",
+        "num_obj": int(num_obj),
+        "num_attr": int(num_attr),
+        "stage2B_provenance": pl_model.stage2B_provenance,
+        "best_ckpt": ckpt_cb.best_model_path or "",
+        "export_path": str(export_path),
+    }
+    (save_dir / "stage3_meta.json").write_text(json.dumps(stage_meta, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[Export] stage3 state_dict -> {export_path}")
     print(f"[Best] {ckpt_cb.best_model_path}")
 

@@ -585,6 +585,7 @@ def collate_fn(batch):
 
 def main():
     torch.set_float32_matmul_precision('medium')
+    print("[Pipeline] Stage1 start: no upstream checkpoint dependencies.")
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--hf_endpoint", type=str, default=None)

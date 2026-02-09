@@ -1,1 +1,10 @@
-LD_PRELOAD=/media/disk/02drive/13hias/04bxy/OmniGraph/ittnotify_stub.so HF_ENDPOINT=https://hf-mirror.com HUGGINGFACE_HUB_BASE_URL=https://hf-mirror.com HF_HOME=/media/disk/02drive/13hias/.cache /media/disk/02drive/13hias/miniconda3/bin/conda run -n llava310 --no-capture-output python /home/hias/.vscode-server/extensions/ms-python.python-2026.1.2026011501-linux-x64/python_files/get_output_via_markers.py /media/disk/02drive/13hias/04bxy/OmniGraph/omnigraph/train/train_projectors.py
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "[Deprecated] stage2.sh is no longer used in strict pipeline mode."
+echo "Use the new training chain instead:"
+echo "  1) ./train_stage1.sh"
+echo "  2) ./train_stage2A.sh"
+echo "  3) ./train_stage2B.sh"
+echo "  4) ./train_stage3.sh"
+exit 1

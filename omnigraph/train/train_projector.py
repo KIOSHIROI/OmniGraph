@@ -39,7 +39,6 @@ from omnigraph.data.vg_scene_graph_dataset import (  # noqa: E402
 )
 
 # Model
-import omnigraph.model.OmniGraphModel as omnigraph_model_module  # noqa: E402
 from omnigraph.model.OmniGraphModel import OmniGraphModel  # noqa: E402
 
 
@@ -259,6 +258,53 @@ def build_chat_inputs_and_labels(
 
 
 # ---------------------------------------------------------------------------
+# Upstream checkpoint loading
+# ---------------------------------------------------------------------------
+
+def load_stage1_qformer_weights(model: OmniGraphModel, stage1_qformer_ckpt: str) -> Dict[str, Any]:
+    ckpt_path = Path(stage1_qformer_ckpt)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"--stage1_qformer_ckpt not found: {stage1_qformer_ckpt}")
+
+    obj = torch.load(str(ckpt_path), map_location="cpu")
+    if not isinstance(obj, dict):
+        raise ValueError(f"Invalid stage1 qformer checkpoint format: {stage1_qformer_ckpt}")
+
+    # Accept both raw graph_qformer state_dict and prefixed variants.
+    if any(k.startswith("graph_qformer.") for k in obj.keys()):
+        qformer_sd = {k.replace("graph_qformer.", "", 1): v for k, v in obj.items() if k.startswith("graph_qformer.")}
+    else:
+        qformer_sd = obj
+
+    model_keys = set(model.graph_qformer.state_dict().keys())
+    overlap = sorted(model_keys.intersection(qformer_sd.keys()))
+    if not overlap:
+        raise RuntimeError(
+            "Stage1 checkpoint has no overlapping GraphQFormer keys. "
+            "Expected checkpoint from train_graph_qfromer.py output."
+        )
+
+    missing, unexpected = model.graph_qformer.load_state_dict(qformer_sd, strict=False)
+    loaded = len(overlap)
+    total = len(model_keys)
+    if loaded == 0 or total == 0:
+        raise RuntimeError("Failed to load GraphQFormer weights from Stage1 checkpoint.")
+
+    info = {
+        "stage1_qformer_ckpt": str(ckpt_path),
+        "loaded_keys": loaded,
+        "total_model_keys": total,
+        "missing_keys": len(missing),
+        "unexpected_keys": len(unexpected),
+    }
+    print(
+        "[Stage2A] Loaded Stage1 GraphQFormer: "
+        f"loaded={loaded}/{total} missing={len(missing)} unexpected={len(unexpected)}"
+    )
+    return info
+
+
+# ---------------------------------------------------------------------------
 # LightningModule (Stage2-A)
 # ---------------------------------------------------------------------------
 
@@ -279,6 +325,9 @@ class ProjectorPL(pl.LightningModule):
         self,
         llm_model_name: str,
         graph_model_name: str,
+        num_obj: int,
+        num_attr: int,
+        stage1_qformer_ckpt: str,
         lr: float,
         max_length: int,
         auto_resize_token_embeddings: bool = True,
@@ -290,7 +339,10 @@ class ProjectorPL(pl.LightningModule):
             graph_model_name=graph_model_name,
             llm_model_name=llm_model_name,
             enable_vision=False,
+            num_obj=int(num_obj),
+            num_attr=int(num_attr),
         )
+        self.stage1_load_info = load_stage1_qformer_weights(self.model, stage1_qformer_ckpt)
 
         # Stage2-A trainable selection
         for name, p in self.model.named_parameters():
@@ -432,19 +484,27 @@ def main():
     ap.add_argument("--max_steps", type=int, default=80000)
 
     ap.add_argument("--save_dir", type=str, default="checkpoints_projector_vg/stage2A")
+    ap.add_argument(
+        "--stage1_qformer_ckpt",
+        type=str,
+        required=True,
+        help="Path to Stage1 graph_qformer checkpoint (graph_qformer_stage1.pt)",
+    )
 
     args = ap.parse_args()
     pl.seed_everything(int(args.seed), workers=True)
+    print("[Pipeline] Stage2A start: requires Stage1 GraphQFormer checkpoint.")
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
+    stage1_ckpt = Path(args.stage1_qformer_ckpt)
+    if not stage1_ckpt.exists():
+        raise FileNotFoundError(f"--stage1_qformer_ckpt not found: {stage1_ckpt}")
 
-    # 1) build vocabs -> NUM_OBJ/NUM_ATTR (OmniGraphModel depends on module globals)
+    # 1) build vocabs
     obj_vocab, pred_vocab, attr_vocab = build_vg_vocabs_from_file(args.scene_graphs, min_freq=args.min_freq)
     num_obj = len(obj_vocab.stoi)
     num_attr = len(attr_vocab.stoi)
-    omnigraph_model_module.NUM_OBJ = num_obj
-    omnigraph_model_module.NUM_ATTR = num_attr
     print(f"[Vocab] NUM_OBJ={num_obj} NUM_ATTR={num_attr}")
 
     # 2) scene graph dataset
@@ -501,6 +561,9 @@ def main():
     pl_model = ProjectorPL(
         llm_model_name=args.llm,
         graph_model_name=args.graph_model,
+        num_obj=int(num_obj),
+        num_attr=int(num_attr),
+        stage1_qformer_ckpt=str(stage1_ckpt),
         lr=float(args.lr),
         max_length=int(args.max_length),
         auto_resize_token_embeddings=True,
@@ -551,6 +614,16 @@ def main():
     best_path = ckpt_cb.best_model_path or ""
     export_path = save_dir / "model_state_dict.pt"
     torch.save(pl_model.model.state_dict(), str(export_path))
+    stage_meta = {
+        "stage": "stage2A",
+        "stage1_qformer_ckpt": str(stage1_ckpt),
+        "num_obj": int(num_obj),
+        "num_attr": int(num_attr),
+        "stage1_load_info": pl_model.stage1_load_info,
+        "best_ckpt": best_path,
+        "export_path": str(export_path),
+    }
+    (save_dir / "stage2A_meta.json").write_text(json.dumps(stage_meta, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[stage2A] exported state_dict -> {export_path}")
     if best_path:
         print(f"[stage2A] best ckpt -> {best_path}")

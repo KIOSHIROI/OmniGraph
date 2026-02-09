@@ -1,6 +1,7 @@
 python omnigraph/train/train_projector.py \
   --scene_graphs data/vg/contents/sceneGraphs/scene_graphs.json \
   --regions data/vg/contents/regionDescriptions/region_descriptions.json \
+  --stage1_qformer_ckpt graph_qformer_stage1.pt \
   --gpu 0 \
   --batch_size 2 \
   --precision 32 \

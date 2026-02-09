@@ -6,7 +6,7 @@ import json
 import argparse
 import random
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 # ---------------------------------------------------------------------------
 # Repo bootstrap + env
@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from transformers import AutoTokenizer
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
 
@@ -33,7 +33,6 @@ from omnigraph.data.vg_scene_graph_dataset import (  # noqa: E402
 )
 
 # Model
-import omnigraph.model.OmniGraphModel as omnigraph_model_module  # noqa: E402
 from omnigraph.model.OmniGraphModel import OmniGraphModel  # noqa: E402
 
 
@@ -130,28 +129,42 @@ class VGGraphRegionTextDataset(torch.utils.data.Dataset):
         }
 
 
-def split_train_val(dataset: torch.utils.data.Dataset, val_ratio: float, seed: int = 42):
-    n = len(dataset)
-    n_val = max(1, int(n * val_ratio)) if val_ratio > 0 else 0
-    idxs = list(range(n))
-    random.Random(seed).shuffle(idxs)
-    val_idxs = set(idxs[:n_val])
-    train_idxs = [i for i in idxs if i not in val_idxs]
+def split_by_image_id(
+    dataset: VGGraphRegionTextDataset,
+    val_ratio: float,
+    seed: int,
+) -> Tuple[Subset, Subset, Set[int], Set[int]]:
+    image_ids = sorted({iid for (iid, _) in dataset.samples})
+    rng = random.Random(int(seed))
+    rng.shuffle(image_ids)
 
-    class _Subset(torch.utils.data.Dataset):
-        def __init__(self, ds, indices):
-            self.ds = ds
-            self.indices = indices
+    if len(image_ids) <= 1:
+        val_ids = set(image_ids)
+    else:
+        n_val = max(1, int(len(image_ids) * float(val_ratio)))
+        val_ids = set(image_ids[:n_val])
+    train_ids = set(image_ids) - val_ids
 
-        def __len__(self):
-            return len(self.indices)
+    train_indices: List[int] = []
+    val_indices: List[int] = []
+    for idx, (iid, _) in enumerate(dataset.samples):
+        if iid in val_ids:
+            val_indices.append(idx)
+        else:
+            train_indices.append(idx)
 
-        def __getitem__(self, i):
-            return self.ds[self.indices[i]]
+    if not train_indices and len(val_indices) > 1:
+        train_indices = val_indices[:-1]
+        val_indices = val_indices[-1:]
+        train_ids = {dataset.samples[i][0] for i in train_indices}
+        val_ids = {dataset.samples[i][0] for i in val_indices}
 
-    if n_val == 0:
-        return _Subset(dataset, train_idxs), None
-    return _Subset(dataset, train_idxs), _Subset(dataset, list(val_idxs))
+    if not train_indices:
+        raise RuntimeError("Stage2B split failed: empty train set after image_id split.")
+    if not val_indices:
+        raise RuntimeError("Stage2B split failed: empty val set after image_id split.")
+
+    return Subset(dataset, train_indices), Subset(dataset, val_indices), train_ids, val_ids
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +259,9 @@ class Stage2BProjectorPL(pl.LightningModule):
         self,
         llm_model_name: str,
         graph_model_name: str,
+        num_obj: int,
+        num_attr: int,
+        stage2A_ckpt: str,
         lr: float,
         max_length: int,
         auto_resize_token_embeddings: bool = True,
@@ -257,6 +273,8 @@ class Stage2BProjectorPL(pl.LightningModule):
             graph_model_name=graph_model_name,
             llm_model_name=llm_model_name,
             enable_vision=False,
+            num_obj=int(num_obj),
+            num_attr=int(num_attr),
         )
 
         # trainable params (Stage2-B)
@@ -380,17 +398,37 @@ class Stage2BProjectorPL(pl.LightningModule):
 # ---------------------------------------------------------------------------
 def load_stage2A_weights_only(pl_model: Stage2BProjectorPL, ckpt_path: str):
     ckpt = torch.load(ckpt_path, map_location="cpu")
-    sd = ckpt.get("state_dict", ckpt)  # lightning ckpt uses "state_dict"
+    if not isinstance(ckpt, dict) or "state_dict" not in ckpt:
+        raise RuntimeError(
+            "Stage2B requires a Stage2A Lightning checkpoint (.ckpt) from the strict pipeline."
+        )
+
+    hp = ckpt.get("hyper_parameters", {}) or {}
+    stage1_qformer_ckpt = hp.get("stage1_qformer_ckpt")
+    if not stage1_qformer_ckpt:
+        raise RuntimeError(
+            "Stage2A checkpoint metadata missing 'stage1_qformer_ckpt'. "
+            "Use Stage2A checkpoint generated with --stage1_qformer_ckpt."
+        )
+
+    sd = ckpt["state_dict"]
     # strip "model." prefix -> match OmniGraphModel keys
     if any(k.startswith("model.") for k in sd.keys()):
         sd = {k.replace("model.", "", 1): v for k, v in sd.items() if k.startswith("model.")}
     missing, unexpected = pl_model.model.load_state_dict(sd, strict=False)
     print(f"[Stage2B] loaded weights-only from: {ckpt_path}")
     print(f"[Stage2B] missing={len(missing)} unexpected={len(unexpected)}")
+    print(f"[Stage2B] Stage2A provenance: stage1_qformer_ckpt={stage1_qformer_ckpt}")
     if missing:
         print("  missing head:", missing[:20])
     if unexpected:
         print("  unexpected head:", unexpected[:20])
+    return {
+        "stage2A_ckpt": str(ckpt_path),
+        "stage1_qformer_ckpt": str(stage1_qformer_ckpt),
+        "missing_keys": len(missing),
+        "unexpected_keys": len(unexpected),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -424,13 +462,14 @@ def main():
     args = ap.parse_args()
 
     pl.seed_everything(args.seed, workers=True)
+    print("[Pipeline] Stage2B start: requires Stage2A .ckpt with Stage1 provenance metadata.")
+    if not Path(args.stage2A_ckpt).exists():
+        raise FileNotFoundError(f"--stage2A_ckpt not found: {args.stage2A_ckpt}")
 
-    # 1) build vocabs -> NUM_OBJ/NUM_ATTR
+    # 1) build vocabs
     obj_vocab, pred_vocab, attr_vocab = build_vg_vocabs_from_file(args.scene_graphs, min_freq=args.min_freq)
     num_obj = len(obj_vocab.stoi)
     num_attr = len(attr_vocab.stoi)
-    omnigraph_model_module.NUM_OBJ = num_obj
-    omnigraph_model_module.NUM_ATTR = num_attr
     print(f"[Vocab] NUM_OBJ={num_obj} NUM_ATTR={num_attr}")
 
     # 2) scene graph dataset
@@ -448,8 +487,20 @@ def main():
     # 3) region phrases dataset
     region_pairs = load_region_pairs(args.regions)
     full_dataset = VGGraphRegionTextDataset(sg_dataset=sg_dataset, region_pairs=region_pairs, prompt="Describe the region.")
+    print(f"[Join] usable_pairs={len(full_dataset)}")
+    if len(full_dataset) == 0:
+        raise RuntimeError("No usable pairs for Stage2B after scene-graph/region join.")
 
-    train_ds, val_ds = split_train_val(full_dataset, val_ratio=args.val_ratio, seed=args.seed)
+    train_ds, val_ds, train_ids, val_ids = split_by_image_id(
+        full_dataset,
+        val_ratio=float(args.val_ratio),
+        seed=int(args.seed),
+    )
+    overlap = train_ids.intersection(val_ids)
+    print(f"[Split] train={len(train_ds)} val={len(val_ds)} train_images={len(train_ids)} val_images={len(val_ids)}")
+    print(f"[SplitCheck] train_image_ids ∩ val_image_ids = {len(overlap)}")
+    if overlap:
+        raise RuntimeError(f"Leakage detected in Stage2B split: overlap image_ids={list(sorted(overlap))[:10]}")
 
     train_loader = DataLoader(
         train_ds,
@@ -459,28 +510,29 @@ def main():
         pin_memory=True,
         collate_fn=collate_graph_text,
     )
-    val_loader = None
-    if val_ds is not None:
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            collate_fn=collate_graph_text,
-        )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        collate_fn=collate_graph_text,
+    )
 
     # 4) stage2-B model
     pl_model = Stage2BProjectorPL(
         llm_model_name=args.llm,
         graph_model_name=args.graph_model,
+        num_obj=int(num_obj),
+        num_attr=int(num_attr),
+        stage2A_ckpt=str(args.stage2A_ckpt),
         lr=args.lr,
         max_length=args.max_length,
         auto_resize_token_embeddings=True,
     )
 
     # 5) init from stage2-A (weights only)
-    load_stage2A_weights_only(pl_model, args.stage2A_ckpt)
+    stage2a_provenance = load_stage2A_weights_only(pl_model, args.stage2A_ckpt)
 
     # 6) callbacks
     save_dir = Path(args.save_dir)
@@ -490,13 +542,13 @@ def main():
         dirpath=str(save_dir),
         filename="stage2B-step={step:07d}-val_loss={val_loss:.3f}",
         save_top_k=1,
-        monitor="val_loss" if val_loader is not None else "train_loss",
+        monitor="val_loss",
         mode="min",
         save_last=True,
     )
     lr_monitor = LearningRateMonitor(logging_interval="step")
     early = EarlyStopping(
-        monitor="val_loss" if val_loader is not None else "train_loss",
+        monitor="val_loss",
         mode="min",
         patience=args.patience,
         min_delta=args.min_delta,
@@ -517,8 +569,8 @@ def main():
         log_every_n_steps=10,
         gradient_clip_val=1.0,
         accumulate_grad_batches=4,
-        val_check_interval=2000 if val_loader is not None else None,  # 让 val 更早发生；不想频繁可改大
-        check_val_every_n_epoch=None if val_loader is not None else 1,
+        val_check_interval=2000,
+        check_val_every_n_epoch=None,
     )
 
     trainer.fit(pl_model, train_dataloaders=train_loader, val_dataloaders=val_loader)
@@ -526,6 +578,15 @@ def main():
     # 7) export pure weights (OmniGraphModel)
     out_pt = save_dir / "stage2B_model_state_dict.pt"
     torch.save(pl_model.model.state_dict(), str(out_pt))
+    stage_meta = {
+        "stage": "stage2B",
+        "num_obj": int(num_obj),
+        "num_attr": int(num_attr),
+        "stage2A_provenance": stage2a_provenance,
+        "best_ckpt": ckpt.best_model_path or "",
+        "export_path": str(out_pt),
+    }
+    (save_dir / "stage2B_meta.json").write_text(json.dumps(stage_meta, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[Saved] weights -> {out_pt}")
 
 

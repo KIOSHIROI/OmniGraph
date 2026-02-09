@@ -21,7 +21,6 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoProcessor
 
 from omnigraph.data.vg_scene_graph_dataset import build_vg_vocabs_from_file, VGSceneGraphDataset
-import omnigraph.model.OmniGraphModel as omnigraph_model_module
 from omnigraph.model.OmniGraphModel import OmniGraphModel
 from omnigraph.train.train_stage3 import VGTriModalRegionDataset, collate_tri
 
@@ -52,8 +51,8 @@ def main() -> int:
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() and args.gpu >= 0 else "cpu")
 
     obj_vocab, pred_vocab, attr_vocab = build_vg_vocabs_from_file(args.scene_graphs, min_freq=2)
-    omnigraph_model_module.NUM_OBJ = len(obj_vocab.stoi)
-    omnigraph_model_module.NUM_ATTR = len(attr_vocab.stoi)
+    num_obj = len(obj_vocab.stoi)
+    num_attr = len(attr_vocab.stoi)
 
     sg_dataset = VGSceneGraphDataset(
         scene_graphs_path=args.scene_graphs,
@@ -98,6 +97,8 @@ def main() -> int:
         vision_model_name=args.vision,
         llm_model_name=args.llm,
         enable_vision=True,
+        num_obj=int(num_obj),
+        num_attr=int(num_attr),
     )
     sd = torch.load(args.ckpt, map_location="cpu")
     model.load_state_dict(sd, strict=False)

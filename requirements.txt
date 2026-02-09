@@ -4,6 +4,8 @@ torch==2.3.1+cu121
 transformers>=4.44.0
 accelerate>=0.31.0
 tokenizers>=0.19.1
+pytorch-lightning>=2.2.0
+Pillow>=10.0.0
 
 torch-geometric>=2.5.3
 numpy>=1.26.4
@@ -12,3 +14,7 @@ tqdm
 networkx>=3.1
 jsonpatch
 pyyaml
+
+# Optional for VG caption evaluation only (not required for GQA mainline):
+# pycocotools
+# git+https://github.com/salaniz/pycocoevalcap
