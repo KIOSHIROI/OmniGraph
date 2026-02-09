@@ -15,5 +15,6 @@ $PYTHON_BIN omnigraph/train/train_graph_qfromer.py \
 	--batch_size 32 \
 	--lr 1e-4 \
 	--epochs 20 \
+	--gtm_max_len 512 \
 	--dataset_paths data/train_instruct_graphmatch.json data/arxiv_pub_node_st_cot_link_mix.json \
 	--text_model_name sentence-transformers/all-MiniLM-L6-v2

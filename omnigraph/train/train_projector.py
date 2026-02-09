@@ -312,7 +312,8 @@ def load_stage1_qformer_weights(model: OmniGraphModel, stage1_qformer_ckpt: str)
     else:
         qformer_sd = obj
 
-    model_keys = set(model.graph_qformer.state_dict().keys())
+    model_state = model.graph_qformer.state_dict()
+    model_keys = set(model_state.keys())
     overlap = sorted(model_keys.intersection(qformer_sd.keys()))
     if not overlap:
         raise RuntimeError(
@@ -320,7 +321,38 @@ def load_stage1_qformer_weights(model: OmniGraphModel, stage1_qformer_ckpt: str)
             "Expected checkpoint from train_graph_qfromer.py output."
         )
 
-    missing, unexpected = model.graph_qformer.load_state_dict(qformer_sd, strict=False)
+    adapted = []
+    skipped = []
+    filtered_sd = {}
+    for k, v in qformer_sd.items():
+        if k not in model_state:
+            continue
+        tgt = model_state[k]
+        if getattr(v, "shape", None) == getattr(tgt, "shape", None):
+            filtered_sd[k] = v
+            continue
+
+        # Compatibility shim for Stage1 ckpt with different max position length.
+        if k.endswith("bert.embeddings.position_embeddings.weight"):
+            if v.dim() == 2 and tgt.dim() == 2 and v.size(1) == tgt.size(1):
+                new_v = tgt.clone()
+                n = min(v.size(0), tgt.size(0))
+                new_v[:n] = v[:n]
+                filtered_sd[k] = new_v
+                adapted.append((k, tuple(v.shape), tuple(tgt.shape)))
+                continue
+        if k.endswith("bert.embeddings.position_ids"):
+            if v.dim() == 2 and tgt.dim() == 2:
+                new_v = tgt.clone()
+                n = min(v.size(1), tgt.size(1))
+                new_v[:, :n] = v[:, :n]
+                filtered_sd[k] = new_v
+                adapted.append((k, tuple(v.shape), tuple(tgt.shape)))
+                continue
+
+        skipped.append((k, tuple(v.shape), tuple(tgt.shape)))
+
+    missing, unexpected = model.graph_qformer.load_state_dict(filtered_sd, strict=False)
     loaded = len(overlap)
     total = len(model_keys)
     if loaded == 0 or total == 0:
@@ -332,11 +364,18 @@ def load_stage1_qformer_weights(model: OmniGraphModel, stage1_qformer_ckpt: str)
         "total_model_keys": total,
         "missing_keys": len(missing),
         "unexpected_keys": len(unexpected),
+        "adapted_keys": len(adapted),
+        "skipped_shape_mismatch_keys": len(skipped),
     }
     print(
         "[Stage2A] Loaded Stage1 GraphQFormer: "
-        f"loaded={loaded}/{total} missing={len(missing)} unexpected={len(unexpected)}"
+        f"loaded={loaded}/{total} missing={len(missing)} unexpected={len(unexpected)} "
+        f"adapted={len(adapted)} skipped={len(skipped)}"
     )
+    if adapted:
+        print(f"[Stage2A] Adapted keys (example): {adapted[0][0]} {adapted[0][1]} -> {adapted[0][2]}")
+    if skipped:
+        print(f"[Stage2A] Skipped mismatched keys (example): {skipped[0][0]} {skipped[0][1]} -> {skipped[0][2]}")
     return info
 
 

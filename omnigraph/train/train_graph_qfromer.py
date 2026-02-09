@@ -603,7 +603,7 @@ def main():
     parser.add_argument("--aux_neigh_text_weight", type=float, default=0.0)
     parser.add_argument("--text_model_name", type=str, default="sentence-transformers/all-mpnet-base-v2")
     parser.add_argument("--text_max_len", type=int, default=512)
-    parser.add_argument("--gtm_max_len", type=int, default=768)
+    parser.add_argument("--gtm_max_len", type=int, default=512)
     args = parser.parse_args()
 
     setup_env(hf_endpoint=args.hf_endpoint, hf_cache_dir=args.hf_cache_dir)
