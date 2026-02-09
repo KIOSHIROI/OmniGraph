@@ -36,6 +36,7 @@ from omnigraph.data.vg_scene_graph_dataset import (  # noqa: E402
     build_vg_vocabs_from_file,
     VGSceneGraphDataset,
 )
+from omnigraph.data.vg_graph_qa import build_vg_graph_qa_records  # noqa: E402
 
 # Model
 from omnigraph.model.OmniGraphModel import OmniGraphModel  # noqa: E402
@@ -157,6 +158,7 @@ class VGTriModalRegionDataset(Dataset):
         sg_dataset: VGSceneGraphDataset,
         region_records: List[Dict[str, Any]],
         image_root: str,
+        qa_records: Optional[List[Dict[str, Any]]] = None,
         prompt: str = "Describe the region.",
         min_phrase_len: int = 1,
     ):
@@ -198,12 +200,44 @@ class VGTriModalRegionDataset(Dataset):
                     "sg_idx": int(self.image2idx[iid]),
                     "img_path": img_path,
                     "phrase": phrase,
+                    "prompt": self.prompt,
                     "x": int(rr.get("x", 0)),
                     "y": int(rr.get("y", 0)),
                     "w": int(rr.get("w", rr.get("width", 0)) if rr.get("w", None) is not None else 0),
                     "h": int(rr.get("h", rr.get("height", 0)) if rr.get("h", None) is not None else 0),
+                    "source": "region",
                 }
             )
+
+        if qa_records:
+            for qa in qa_records:
+                try:
+                    iid = int(qa.get("image_id"))
+                except Exception:
+                    continue
+                if iid not in self.image2idx:
+                    continue
+                q = str(qa.get("question", "")).strip()
+                a = str(qa.get("answer", "")).strip()
+                if not q or not a:
+                    continue
+                img_path = find_image_path(self.image_root, iid)
+                if img_path is None:
+                    continue
+                self.samples.append(
+                    {
+                        "image_id": iid,
+                        "sg_idx": int(self.image2idx[iid]),
+                        "img_path": img_path,
+                        "phrase": a,
+                        "prompt": q,
+                        "x": 0,
+                        "y": 0,
+                        "w": 0,
+                        "h": 0,
+                        "source": "graph_qa",
+                    }
+                )
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -231,11 +265,11 @@ class VGTriModalRegionDataset(Dataset):
             img = img.crop((x0, y0, x1, y1))
 
         return {
-            "id": f"{image_id}_r{idx}",
+            "id": f"{image_id}_{s.get('source', 'mix')}_{idx}",
             "image_id": image_id,
             "graph_data": graph_data,
             "pil_image": img,
-            "prompt": self.prompt,
+            "prompt": str(s.get("prompt", self.prompt)),
             "answer": str(s["phrase"]),
         }
 
@@ -621,6 +655,10 @@ def main():
     ap.add_argument("--max_nodes", type=int, default=80)
     ap.add_argument("--max_attrs", type=int, default=6)
     ap.add_argument("--prompt", type=str, default="Describe the region.")
+    ap.add_argument("--disable_graph_qa", action="store_true", help="Disable synthetic graph QA from VG scene graphs.")
+    ap.add_argument("--graph_qa_max_per_image", type=int, default=2, help="Max synthetic QA pairs per image.")
+    ap.add_argument("--graph_qa_repeat", type=int, default=1, help="Repeat factor for synthetic graph QA samples.")
+    ap.add_argument("--graph_qa_seed", type=int, default=42, help="Random seed for synthetic graph QA generation.")
 
     args = ap.parse_args()
     pl.seed_everything(int(args.seed), workers=True)
@@ -653,10 +691,25 @@ def main():
     region_records = load_region_records(args.regions)
     print(f"[Regions] loaded records={len(region_records)}")
 
+    qa_records: List[Dict[str, Any]] = []
+    if not bool(args.disable_graph_qa):
+        qa_records = build_vg_graph_qa_records(
+            scene_graph_items=sg_dataset.items,
+            max_per_image=int(args.graph_qa_max_per_image),
+            seed=int(args.graph_qa_seed),
+        )
+        repeat = max(1, int(args.graph_qa_repeat))
+        if repeat > 1 and len(qa_records) > 0:
+            qa_records = qa_records * repeat
+        print(f"[GraphQA] synthetic_pairs={len(qa_records)} (repeat={repeat})")
+    else:
+        print("[GraphQA] disabled.")
+
     full_dataset = VGTriModalRegionDataset(
         sg_dataset=sg_dataset,
         region_records=region_records,
         image_root=args.image_root,
+        qa_records=qa_records,
         prompt=str(args.prompt),
     )
     print(f"[Join] usable_samples={len(full_dataset)}")

@@ -312,7 +312,16 @@ def main() -> int:
             # ensure graph_node for GraphCLIP-GT
             if hasattr(graph_data, "obj_id") and hasattr(graph_data, "attr_id") and hasattr(graph_data, "bbox"):
                 try:
-                    graph_node = model.vg_adapter(graph_data.obj_id, graph_data.attr_id, graph_data.bbox)
+                    graph_node = model.vg_adapter(
+                        graph_data.obj_id,
+                        graph_data.attr_id,
+                        graph_data.bbox,
+                        obj_hash_id=getattr(graph_data, "obj_hash_id", None),
+                        attr_hash_id=getattr(graph_data, "attr_hash_id", None),
+                        edge_index=getattr(graph_data, "edge_index", None),
+                        edge_pred_id=getattr(graph_data, "edge_pred_id", None),
+                        edge_pred_hash_id=getattr(graph_data, "edge_pred_hash_id", None),
+                    )
                     graph_data.graph_node = graph_node
                     graph_data.x = graph_node
                 except Exception:

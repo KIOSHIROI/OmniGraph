@@ -31,6 +31,7 @@ from omnigraph.data.vg_scene_graph_dataset import (  # noqa: E402
     build_vg_vocabs_from_file,
     VGSceneGraphDataset,
 )
+from omnigraph.data.vg_graph_qa import build_vg_graph_qa_records  # noqa: E402
 
 # Model
 from omnigraph.model.OmniGraphModel import OmniGraphModel  # noqa: E402
@@ -89,6 +90,7 @@ class VGGraphRegionTextDataset(torch.utils.data.Dataset):
         self,
         sg_dataset: VGSceneGraphDataset,
         region_pairs: List[Tuple[int, str]],
+        qa_records: List[Dict[str, Any]] | None = None,
         prompt: str = "Describe the region.",
     ):
         self.sg = sg_dataset
@@ -111,20 +113,50 @@ class VGGraphRegionTextDataset(torch.utils.data.Dataset):
             if isinstance(it, dict) and "image_id" in it:
                 self.image2idx[int(it["image_id"])] = i
 
-        # keep only pairs with existing scene graph
-        self.samples: List[Tuple[int, str]] = [(iid, phr) for iid, phr in region_pairs if iid in self.image2idx]
+        self.samples: List[Dict[str, Any]] = []
+        for iid, phr in region_pairs:
+            if iid in self.image2idx:
+                self.samples.append(
+                    {
+                        "image_id": int(iid),
+                        "prompt": self.prompt,
+                        "answer": str(phr),
+                        "source": "region",
+                    }
+                )
+        if qa_records:
+            for rec in qa_records:
+                iid = int(rec.get("image_id", -1))
+                if iid not in self.image2idx:
+                    continue
+                q = str(rec.get("question", "")).strip()
+                a = str(rec.get("answer", "")).strip()
+                if not q or not a:
+                    continue
+                self.samples.append(
+                    {
+                        "image_id": int(iid),
+                        "prompt": q,
+                        "answer": a,
+                        "source": "graph_qa",
+                    }
+                )
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        image_id, phrase = self.samples[idx]
+        s = self.samples[idx]
+        image_id = int(s["image_id"])
+        phrase = str(s["answer"])
+        prompt = str(s["prompt"])
+        source = str(s["source"])
         sg_idx = self.image2idx[image_id]
         sg_item = self.sg[sg_idx]
         return {
-            "id": f"{image_id}_r{idx}",
+            "id": f"{image_id}_{source}_{idx}",
             "graph_data": sg_item["graph_data"],
-            "text": self.prompt,
+            "text": prompt,
             "answer": phrase,
         }
 
@@ -134,7 +166,7 @@ def split_by_image_id(
     val_ratio: float,
     seed: int,
 ) -> Tuple[Subset, Subset, Set[int], Set[int]]:
-    image_ids = sorted({iid for (iid, _) in dataset.samples})
+    image_ids = sorted({int(s["image_id"]) for s in dataset.samples})
     rng = random.Random(int(seed))
     rng.shuffle(image_ids)
 
@@ -147,7 +179,8 @@ def split_by_image_id(
 
     train_indices: List[int] = []
     val_indices: List[int] = []
-    for idx, (iid, _) in enumerate(dataset.samples):
+    for idx, s in enumerate(dataset.samples):
+        iid = int(s["image_id"])
         if iid in val_ids:
             val_indices.append(idx)
         else:
@@ -156,8 +189,8 @@ def split_by_image_id(
     if not train_indices and len(val_indices) > 1:
         train_indices = val_indices[:-1]
         val_indices = val_indices[-1:]
-        train_ids = {dataset.samples[i][0] for i in train_indices}
-        val_ids = {dataset.samples[i][0] for i in val_indices}
+        train_ids = {int(dataset.samples[i]["image_id"]) for i in train_indices}
+        val_ids = {int(dataset.samples[i]["image_id"]) for i in val_indices}
 
     if not train_indices:
         raise RuntimeError("Stage2B split failed: empty train set after image_id split.")
@@ -432,6 +465,18 @@ def load_stage2A_weights_only(pl_model: Stage2BProjectorPL, ckpt_path: str):
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _parse_val_check_interval(x: float) -> float | int:
+    x = float(x)
+    if x >= 1.0:
+        return int(x)
+    if x <= 0.0:
+        return 1.0
+    return x
+
+
+# ---------------------------------------------------------------------------
 # Entry
 # ---------------------------------------------------------------------------
 def main():
@@ -454,11 +499,18 @@ def main():
     ap.add_argument("--min_freq", type=int, default=2)
     ap.add_argument("--max_nodes", type=int, default=80)
     ap.add_argument("--max_attrs", type=int, default=6)
+    ap.add_argument("--disable_graph_qa", action="store_true", help="Disable synthetic graph QA from VG scene graphs.")
+    ap.add_argument("--graph_qa_max_per_image", type=int, default=3, help="Max synthetic QA pairs per image.")
+    ap.add_argument("--graph_qa_repeat", type=int, default=2, help="Repeat factor for synthetic graph QA samples.")
+    ap.add_argument("--graph_qa_seed", type=int, default=42, help="Random seed for synthetic graph QA generation.")
 
     ap.add_argument("--val_ratio", type=float, default=0.001)
     ap.add_argument("--patience", type=int, default=2)
     ap.add_argument("--min_delta", type=float, default=0.01)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--val_check_interval", type=float, default=2000,
+                    help=">=1: validate every N steps; (0,1]: fraction epoch")
+    ap.add_argument("--limit_val_batches", type=float, default=1.0)
     args = ap.parse_args()
 
     pl.seed_everything(args.seed, workers=True)
@@ -486,7 +538,25 @@ def main():
 
     # 3) region phrases dataset
     region_pairs = load_region_pairs(args.regions)
-    full_dataset = VGGraphRegionTextDataset(sg_dataset=sg_dataset, region_pairs=region_pairs, prompt="Describe the region.")
+    qa_records: List[Dict[str, Any]] = []
+    if not bool(args.disable_graph_qa):
+        qa_records = build_vg_graph_qa_records(
+            scene_graph_items=sg_dataset.items,
+            max_per_image=int(args.graph_qa_max_per_image),
+            seed=int(args.graph_qa_seed),
+        )
+        repeat = max(1, int(args.graph_qa_repeat))
+        if repeat > 1 and len(qa_records) > 0:
+            qa_records = qa_records * repeat
+        print(f"[GraphQA] synthetic_pairs={len(qa_records)} (repeat={repeat})")
+    else:
+        print("[GraphQA] disabled.")
+    full_dataset = VGGraphRegionTextDataset(
+        sg_dataset=sg_dataset,
+        region_pairs=region_pairs,
+        qa_records=qa_records,
+        prompt="Describe the region.",
+    )
     print(f"[Join] usable_pairs={len(full_dataset)}")
     if len(full_dataset) == 0:
         raise RuntimeError("No usable pairs for Stage2B after scene-graph/region join.")
@@ -518,6 +588,7 @@ def main():
         pin_memory=True,
         collate_fn=collate_graph_text,
     )
+    vci = _parse_val_check_interval(args.val_check_interval)
 
     # 4) stage2-B model
     pl_model = Stage2BProjectorPL(
@@ -569,8 +640,9 @@ def main():
         log_every_n_steps=10,
         gradient_clip_val=1.0,
         accumulate_grad_batches=4,
-        val_check_interval=2000,
-        check_val_every_n_epoch=None,
+        check_val_every_n_epoch=1,
+        val_check_interval=vci,
+        limit_val_batches=float(args.limit_val_batches),
     )
 
     trainer.fit(pl_model, train_dataloaders=train_loader, val_dataloaders=val_loader)

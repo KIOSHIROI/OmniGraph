@@ -1,4 +1,5 @@
 import json
+import hashlib
 from typing import Any, Dict, List, Optional
 import torch
 from torch.utils.data import Dataset
@@ -52,6 +53,7 @@ class VGSceneGraphDataset(Dataset):
         add_reverse_edges: bool = True,
         # VG 原始文件通常没有 width/height；如果没有，就用 bbox 的 max 做归一化
         use_bbox_max_norm: bool = True,
+        hash_buckets: int = 65536,
     ):
         self.items: List[Dict[str, Any]] = json.load(open(scene_graphs_path, "r", encoding="utf-8"))
         self.obj_vocab = obj_vocab
@@ -61,6 +63,15 @@ class VGSceneGraphDataset(Dataset):
         self.max_attrs = max_attrs
         self.add_reverse_edges = add_reverse_edges
         self.use_bbox_max_norm = use_bbox_max_norm
+        self.hash_buckets = int(hash_buckets)
+
+    def _stable_hash_id(self, token: Optional[str]) -> int:
+        # Deterministic hashing for adapter OOV channel (independent from python hash seed).
+        s = str(token or "").strip().lower()
+        if not s:
+            return 0
+        digest = hashlib.blake2b(s.encode("utf-8"), digest_size=8).digest()
+        return int.from_bytes(digest, byteorder="little", signed=False) % self.hash_buckets
 
     def __len__(self) -> int:
         return len(self.items)
@@ -75,8 +86,11 @@ class VGSceneGraphDataset(Dataset):
             data = Data(edge_index=torch.zeros((2, 0), dtype=torch.long))
             data.obj_id = torch.tensor([self.obj_vocab.unk], dtype=torch.long)
             data.attr_id = torch.full((1, self.max_attrs), self.attr_vocab.pad, dtype=torch.long)
+            data.obj_hash_id = torch.zeros((1,), dtype=torch.long)
+            data.attr_hash_id = torch.zeros((1, self.max_attrs), dtype=torch.long)
             data.bbox = torch.zeros((1, 4), dtype=torch.float32)
             data.edge_pred_id = torch.zeros((0,), dtype=torch.long)
+            data.edge_pred_hash_id = torch.zeros((0,), dtype=torch.long)
             data.num_nodes = 1
             return {"id": sample_id, "graph_data": data, "text": "Describe the scene graph.", "answer": ""}
 
@@ -86,18 +100,29 @@ class VGSceneGraphDataset(Dataset):
 
         objid2idx = {}
         obj_ids, attr_ids, bboxes = [], [], []
+        obj_hash_ids, attr_hash_ids = [], []
         for i, o in enumerate(objs):
             oid = int(o.get("object_id", i))
             objid2idx[oid] = i
 
             name = (o.get("names") or ["object"])[0]
-            obj_ids.append(self.obj_vocab.id(str(name)))
+            name_s = str(name)
+            obj_ids.append(self.obj_vocab.id(name_s))
+            obj_hash_ids.append(self._stable_hash_id(name_s))
 
             attrs = (o.get("attributes", []) or [])[: self.max_attrs]
-            a = [self.attr_vocab.id(str(x)) for x in attrs]
+            a = []
+            ah = []
+            for x in attrs:
+                xs = str(x)
+                a.append(self.attr_vocab.id(xs))
+                ah.append(self._stable_hash_id(xs))
             if len(a) < self.max_attrs:
-                a += [self.attr_vocab.pad] * (self.max_attrs - len(a))
+                pad_n = self.max_attrs - len(a)
+                a += [self.attr_vocab.pad] * pad_n
+                ah += [0] * pad_n
             attr_ids.append(a)
+            attr_hash_ids.append(ah)
 
             x = float(o.get("x", 0.0)); y = float(o.get("y", 0.0))
             w = float(o.get("w", 0.0)); h = float(o.get("h", 0.0))
@@ -110,7 +135,7 @@ class VGSceneGraphDataset(Dataset):
             bbox = bbox / scale
 
         # edges + predicate ids
-        src, dst, pids = [], [], []
+        src, dst, pids, phids = [], [], [], []
         for r in rels:
             sid = r.get("subject_id", None)
             oid = r.get("object_id", None)
@@ -120,18 +145,25 @@ class VGSceneGraphDataset(Dataset):
             if sid not in objid2idx or oid not in objid2idx:
                 continue
             s = objid2idx[sid]; o = objid2idx[oid]
-            p = self.pred_vocab.id(str(r.get("predicate", None)))
+            pred_s = str(r.get("predicate", None))
+            p = self.pred_vocab.id(pred_s)
+            ph = self._stable_hash_id(pred_s)
             src.append(s); dst.append(o); pids.append(p)
+            phids.append(ph)
             if self.add_reverse_edges:
                 src.append(o); dst.append(s); pids.append(p)
+                phids.append(ph)
 
         edge_index = torch.tensor([src, dst], dtype=torch.long) if len(src) else torch.zeros((2, 0), dtype=torch.long)
 
         data = Data(edge_index=edge_index)
         data.obj_id = torch.tensor(obj_ids, dtype=torch.long)            # [N]
         data.attr_id = torch.tensor(attr_ids, dtype=torch.long)          # [N,A]
+        data.obj_hash_id = torch.tensor(obj_hash_ids, dtype=torch.long)  # [N]
+        data.attr_hash_id = torch.tensor(attr_hash_ids, dtype=torch.long)  # [N,A]
         data.bbox = bbox                                                 # [N,4]
         data.edge_pred_id = torch.tensor(pids, dtype=torch.long)         # [E]
+        data.edge_pred_hash_id = torch.tensor(phids, dtype=torch.long)   # [E]
         data.num_nodes = len(obj_ids)
 
         return {

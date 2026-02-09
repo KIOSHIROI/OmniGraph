@@ -37,6 +37,7 @@ from omnigraph.data.vg_scene_graph_dataset import (  # noqa: E402
     build_vg_vocabs_from_file,
     VGSceneGraphDataset,
 )
+from omnigraph.data.vg_graph_qa import build_vg_graph_qa_records  # noqa: E402
 
 # Model
 from omnigraph.model.OmniGraphModel import OmniGraphModel  # noqa: E402
@@ -97,6 +98,7 @@ class VGGraphRegionTextDataset(Dataset):
         self,
         sg_dataset: VGSceneGraphDataset,
         region_pairs: List[Tuple[int, str]],
+        qa_records: Optional[List[Dict[str, Any]]] = None,
         prompt: str = "Describe the region.",
     ):
         self.sg = sg_dataset
@@ -118,24 +120,57 @@ class VGGraphRegionTextDataset(Dataset):
             if isinstance(it, dict) and "image_id" in it:
                 self.image2idx[int(it["image_id"])] = i
 
-        self.samples: List[Tuple[int, str, int]] = []
+        self.samples: List[Dict[str, Any]] = []
         for (iid, phr) in region_pairs:
             sg_idx = self.image2idx.get(int(iid), None)
             if sg_idx is None:
                 continue
-            self.samples.append((int(iid), phr, int(sg_idx)))
+            self.samples.append(
+                {
+                    "image_id": int(iid),
+                    "answer": str(phr),
+                    "prompt": self.prompt,
+                    "sg_idx": int(sg_idx),
+                    "source": "region",
+                }
+            )
+
+        if qa_records:
+            for rec in qa_records:
+                iid = int(rec.get("image_id", -1))
+                sg_idx = self.image2idx.get(iid, None)
+                if sg_idx is None:
+                    continue
+                q = str(rec.get("question", "")).strip()
+                a = str(rec.get("answer", "")).strip()
+                if not q or not a:
+                    continue
+                self.samples.append(
+                    {
+                        "image_id": int(iid),
+                        "answer": a,
+                        "prompt": q,
+                        "sg_idx": int(sg_idx),
+                        "source": "graph_qa",
+                    }
+                )
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        image_id, phrase, sg_idx = self.samples[idx]
+        s = self.samples[idx]
+        image_id = int(s["image_id"])
+        phrase = str(s["answer"])
+        sg_idx = int(s["sg_idx"])
+        prompt = str(s["prompt"])
+        source = str(s["source"])
         sg_item = self.sg[sg_idx]
         return {
-            "id": f"{image_id}_r{idx}",
+            "id": f"{image_id}_{source}_{idx}",
             "image_id": int(image_id),
             "graph_data": sg_item["graph_data"],
-            "text": self.prompt,
+            "text": prompt,
             "answer": phrase,
         }
 
@@ -149,7 +184,7 @@ def split_by_image_id(
     Split by image_id to avoid leakage:
     all phrases under an image_id go either train or val.
     """
-    image_ids = sorted({iid for (iid, _, _) in dataset.samples})
+    image_ids = sorted({int(s["image_id"]) for s in dataset.samples})
     rng = random.Random(seed)
     rng.shuffle(image_ids)
 
@@ -162,7 +197,8 @@ def split_by_image_id(
 
     train_idx: List[int] = []
     val_idx: List[int] = []
-    for i, (iid, _, _) in enumerate(dataset.samples):
+    for i, s in enumerate(dataset.samples):
+        iid = int(s["image_id"])
         if iid in val_set:
             val_idx.append(i)
         else:
@@ -484,6 +520,11 @@ def main():
     ap.add_argument("--max_steps", type=int, default=80000)
 
     ap.add_argument("--save_dir", type=str, default="checkpoints_projector_vg/stage2A")
+    ap.add_argument("--disable_graph_qa", action="store_true", help="Disable synthetic graph QA from VG scene graphs.")
+    ap.add_argument("--graph_qa_max_per_image", type=int, default=3, help="Max synthetic QA pairs per image.")
+    ap.add_argument("--graph_qa_repeat", type=int, default=2, help="Repeat factor for synthetic graph QA samples.")
+    ap.add_argument("--graph_qa_seed", type=int, default=42, help="Random seed for synthetic graph QA generation.")
+
     ap.add_argument(
         "--stage1_qformer_ckpt",
         type=str,
@@ -523,9 +564,24 @@ def main():
     region_pairs = load_region_pairs(args.regions)
     print(f"[Regions] loaded pairs={len(region_pairs)} from {args.regions}")
 
+    qa_records: List[Dict[str, Any]] = []
+    if not bool(args.disable_graph_qa):
+        qa_records = build_vg_graph_qa_records(
+            scene_graph_items=sg_dataset.items,
+            max_per_image=int(args.graph_qa_max_per_image),
+            seed=int(args.graph_qa_seed),
+        )
+        repeat = max(1, int(args.graph_qa_repeat))
+        if repeat > 1 and len(qa_records) > 0:
+            qa_records = qa_records * repeat
+        print(f"[GraphQA] synthetic_pairs={len(qa_records)} (repeat={repeat})")
+    else:
+        print("[GraphQA] disabled.")
+
     full_dataset = VGGraphRegionTextDataset(
         sg_dataset=sg_dataset,
         region_pairs=region_pairs,
+        qa_records=qa_records,
         prompt="Describe the region.",
     )
     print(f"[Join] usable_pairs={len(full_dataset)}")

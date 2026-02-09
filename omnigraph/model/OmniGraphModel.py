@@ -121,6 +121,26 @@ class OmniGraphModel(nn.Module):
         else:
             self.vision_branch = None
             self.vl_projector = None
+
+    def _inject_graph_node_features(self, graph_data):
+        if graph_data is None:
+            return None
+        if not (hasattr(graph_data, "obj_id") and hasattr(graph_data, "attr_id") and hasattr(graph_data, "bbox")):
+            return graph_data
+
+        x = self.vg_adapter(
+            graph_data.obj_id,
+            graph_data.attr_id,
+            graph_data.bbox,
+            obj_hash_id=getattr(graph_data, "obj_hash_id", None),
+            attr_hash_id=getattr(graph_data, "attr_hash_id", None),
+            edge_index=getattr(graph_data, "edge_index", None),
+            edge_pred_id=getattr(graph_data, "edge_pred_id", None),
+            edge_pred_hash_id=getattr(graph_data, "edge_pred_hash_id", None),
+        )
+        graph_data.x = x
+        graph_data.graph_node = x
+        return graph_data
         
     def forward(self, 
                 input_ids, 
@@ -146,11 +166,7 @@ class OmniGraphModel(nn.Module):
         debug = {}
         graph_embeds = None
         if graph_data is not None:
-            # 如果 dataset 输出了 obj_id/attr_id/bbox，则用 adapter 生成 x
-            if hasattr(graph_data, "obj_id") and hasattr(graph_data, "attr_id") and hasattr(graph_data, "bbox"):
-                x = self.vg_adapter(graph_data.obj_id, graph_data.attr_id, graph_data.bbox)
-                graph_data.x = x
-                graph_data.graph_node = x
+            graph_data = self._inject_graph_node_features(graph_data)
             # graph_embeds: (B, Nq_graph, 4096)
             if return_debug:
                 graph_tokens, graph_dbg = self.graph_branch(graph_data, return_debug=True)  # (B, Nq, d_qformer)
@@ -230,6 +246,7 @@ class OmniGraphModel(nn.Module):
         embeds_list = []
         
         if graph_data is not None:
+            graph_data = self._inject_graph_node_features(graph_data)
             graph_tokens = self.graph_branch(graph_data)
             graph_embeds = self.gl_projector(graph_tokens)
             if graph_embeds.dtype != target_dtype:
