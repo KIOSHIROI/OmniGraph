@@ -221,11 +221,20 @@ fi
 GPU_VRAM_GB="unknown"
 if [ "$AUTO_BATCH_BY_VRAM" = "1" ]; then
   read -r GPU_VRAM_GB AUTO_S2A_BATCH AUTO_S2B_BATCH AUTO_S3_BATCH AUTO_S2B_R2_BATCH AUTO_S3_R2_BATCH <<<"$(
-    GPU="$GPU" "$PYTHON_BIN" - <<'PY'
+    GPU="$GPU" \
+    LLM_MODEL="$LLM_MODEL" \
+    S2A_MAX_LENGTH="$S2A_MAX_LENGTH" \
+    S2B_MAX_LENGTH="$S2B_MAX_LENGTH" \
+    S3_MAX_LENGTH="$S3_MAX_LENGTH" \
+    "$PYTHON_BIN" - <<'PY'
 import os
 import torch
 
 gpu = int(os.environ.get("GPU", "0"))
+llm_model = str(os.environ.get("LLM_MODEL", "")).lower()
+s2a_max_len = int(os.environ.get("S2A_MAX_LENGTH", "96"))
+s2b_max_len = int(os.environ.get("S2B_MAX_LENGTH", "96"))
+s3_max_len = int(os.environ.get("S3_MAX_LENGTH", "96"))
 
 if not torch.cuda.is_available():
     print("0.0 1 1 1 1 1")
@@ -235,6 +244,8 @@ if gpu < 0 or gpu >= torch.cuda.device_count():
     gpu = 0
 
 gb = float(torch.cuda.get_device_properties(gpu).total_memory) / (1024 ** 3)
+is_3b = ("3b" in llm_model)
+is_7b = ("7b" in llm_model)
 
 # Aggressive stage-wise defaults:
 # Start high to better fill VRAM; runtime OOM fallback will auto-reduce.
@@ -243,9 +254,19 @@ if gb < 16:
 elif gb < 24:
     s2a, s2b, s3 = 2, 2, 1
 elif gb < 30:
-    s2a, s2b, s3 = 3, 3, 2
+    if is_3b and s2a_max_len <= 96 and s2b_max_len <= 96 and s3_max_len <= 96:
+        s2a, s2b, s3 = 12, 12, 6
+    elif is_3b:
+        s2a, s2b, s3 = 8, 8, 4
+    elif is_7b:
+        s2a, s2b, s3 = 6, 6, 3
+    else:
+        s2a, s2b, s3 = 8, 8, 4
 elif gb < 40:
-    s2a, s2b, s3 = 4, 4, 2
+    if is_7b:
+        s2a, s2b, s3 = 8, 8, 4
+    else:
+        s2a, s2b, s3 = 10, 10, 5
 elif gb < 56:
     s2a, s2b, s3 = 6, 6, 3
 elif gb < 80:
