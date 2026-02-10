@@ -33,6 +33,7 @@ INSTALL_DEPS=${INSTALL_DEPS:-0}
 LOW_VRAM_4090=${LOW_VRAM_4090:-0}
 AUTO_BATCH_RETRY_ON_OOM=${AUTO_BATCH_RETRY_ON_OOM:-1}
 AUTO_BATCH_MAX_RETRIES=${AUTO_BATCH_MAX_RETRIES:-8}
+AUTO_BATCH_SCALE=${AUTO_BATCH_SCALE:-1.0}
 
 # Keep track of whether user explicitly set batch size env vars.
 USER_SET_S2A_BATCH_SIZE=${S2A_BATCH_SIZE+x}
@@ -226,6 +227,7 @@ if [ "$AUTO_BATCH_BY_VRAM" = "1" ]; then
     S2A_MAX_LENGTH="$S2A_MAX_LENGTH" \
     S2B_MAX_LENGTH="$S2B_MAX_LENGTH" \
     S3_MAX_LENGTH="$S3_MAX_LENGTH" \
+    AUTO_BATCH_SCALE="$AUTO_BATCH_SCALE" \
     "$PYTHON_BIN" - <<'PY'
 import os
 import torch
@@ -235,6 +237,7 @@ llm_model = str(os.environ.get("LLM_MODEL", "")).lower()
 s2a_max_len = int(os.environ.get("S2A_MAX_LENGTH", "96"))
 s2b_max_len = int(os.environ.get("S2B_MAX_LENGTH", "96"))
 s3_max_len = int(os.environ.get("S3_MAX_LENGTH", "96"))
+scale = float(os.environ.get("AUTO_BATCH_SCALE", "1.0"))
 
 if not torch.cuda.is_available():
     print("0.0 1 1 1 1 1")
@@ -252,7 +255,16 @@ is_7b = ("7b" in llm_model)
 if gb < 16:
     s2a, s2b, s3 = 1, 1, 1
 elif gb < 24:
-  s2a, s2b, s3 = 4, 4, 2
+  if is_3b and s2a_max_len <= 96 and s2b_max_len <= 96 and s3_max_len <= 96:
+    s2a, s2b, s3 = 16, 16, 8
+  elif is_3b and s2a_max_len <= 160 and s2b_max_len <= 160 and s3_max_len <= 160:
+    s2a, s2b, s3 = 12, 12, 6
+  elif is_3b and s2a_max_len <= 256 and s2b_max_len <= 256 and s3_max_len <= 256:
+    s2a, s2b, s3 = 10, 10, 5
+  elif is_7b:
+    s2a, s2b, s3 = 4, 4, 2
+  else:
+    s2a, s2b, s3 = 5, 5, 2
 elif gb < 30:
   if is_3b and s2a_max_len <= 96 and s2b_max_len <= 96 and s3_max_len <= 96:
     s2a, s2b, s3 = 16, 16, 8
@@ -273,6 +285,11 @@ elif gb < 80:
     s2a, s2b, s3 = 8, 8, 4
 else:
     s2a, s2b, s3 = 10, 10, 6
+
+if scale > 0 and scale != 1.0:
+    s2a = max(1, int(round(s2a * scale)))
+    s2b = max(1, int(round(s2b * scale)))
+    s3 = max(1, int(round(s3 * scale)))
 
 max_bs = int(os.environ.get("MAX_AUTO_BATCH", "64"))
 s2a = min(s2a, max_bs)
@@ -357,6 +374,7 @@ run_with_auto_batch_retry() {
 echo "[Config] LOW_VRAM_4090=${LOW_VRAM_4090} LLM_MODEL=${LLM_MODEL} VISION_MODEL=${VISION_MODEL}"
 echo "[Config] AUTO_BATCH_BY_VRAM=${AUTO_BATCH_BY_VRAM} detected_vram_gb=${GPU_VRAM_GB}"
 echo "[Config] AUTO_BATCH_RETRY_ON_OOM=${AUTO_BATCH_RETRY_ON_OOM} AUTO_BATCH_MAX_RETRIES=${AUTO_BATCH_MAX_RETRIES}"
+echo "[Config] AUTO_BATCH_SCALE=${AUTO_BATCH_SCALE} MAX_AUTO_BATCH=${MAX_AUTO_BATCH:-64}"
 if [ "$AUTO_BATCH_BY_VRAM" = "1" ]; then
   if [ -n "${USER_SET_S2A_BATCH_SIZE:-}" ]; then echo "[Config] manual S2A_BATCH_SIZE=${S2A_BATCH_SIZE} -> skip auto init for Stage2A"; fi
   if [ -n "${USER_SET_S2B_BATCH_SIZE:-}" ]; then echo "[Config] manual S2B_BATCH_SIZE=${S2B_BATCH_SIZE} -> skip auto init for Stage2B"; fi
