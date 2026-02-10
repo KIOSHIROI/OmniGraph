@@ -31,6 +31,8 @@ QUERY_SPRINT_TARGET=${QUERY_SPRINT_TARGET:-0.2800}
 RUN_ROUND2_ON_FAIL=${RUN_ROUND2_ON_FAIL:-1}
 INSTALL_DEPS=${INSTALL_DEPS:-0}
 LOW_VRAM_4090=${LOW_VRAM_4090:-1}
+AUTO_BATCH_RETRY_ON_OOM=${AUTO_BATCH_RETRY_ON_OOM:-1}
+AUTO_BATCH_MAX_RETRIES=${AUTO_BATCH_MAX_RETRIES:-8}
 
 # Keep track of whether user explicitly set batch size env vars.
 USER_SET_S2A_BATCH_SIZE=${S2A_BATCH_SIZE+x}
@@ -53,7 +55,7 @@ if [ "$LOW_VRAM_4090" = "1" ]; then
   if [ "$LLM_MODEL" = "$DEFAULT_LLM_7B" ]; then
     LLM_MODEL="$DEFAULT_LLM_3B"
   fi
-  # Conservative profile for RTX 4090 24GB.
+  # Fallback profile for RTX 4090 24GB.
   : "${S2A_BATCH_SIZE:=1}"
   : "${S2A_MAX_LENGTH:=96}"
   : "${S2A_MAX_GRAPH_TOKENS:=16}"
@@ -234,20 +236,22 @@ if gpu < 0 or gpu >= torch.cuda.device_count():
 
 gb = float(torch.cuda.get_device_properties(gpu).total_memory) / (1024 ** 3)
 
-# Conservative stage-wise defaults:
-# Stage3 is vision+graph+text, keep lower than Stage2A/2B on same VRAM.
+# Aggressive stage-wise defaults:
+# Start high to better fill VRAM; runtime OOM fallback will auto-reduce.
 if gb < 16:
     s2a, s2b, s3 = 1, 1, 1
-elif gb < 30:
-    s2a, s2b, s3 = 1, 1, 1
-elif gb < 40:
+elif gb < 24:
     s2a, s2b, s3 = 2, 2, 1
-elif gb < 56:
+elif gb < 30:
     s2a, s2b, s3 = 3, 3, 2
-elif gb < 80:
+elif gb < 40:
     s2a, s2b, s3 = 4, 4, 2
-else:
+elif gb < 56:
     s2a, s2b, s3 = 6, 6, 3
+elif gb < 80:
+    s2a, s2b, s3 = 8, 8, 4
+else:
+    s2a, s2b, s3 = 10, 10, 6
 
 print(f"{gb:.1f} {s2a} {s2b} {s3} {s2b} {s3}")
 PY
@@ -260,8 +264,80 @@ PY
   if [ -z "${USER_SET_S3_R2_BATCH_SIZE:-}" ]; then S3_R2_BATCH_SIZE="$AUTO_S3_R2_BATCH"; fi
 fi
 
+is_oom_log_file() {
+  local log_file="$1"
+  local pattern="out of memory|cuda out of memory|cuda error: out of memory|cublas_status_alloc_failed"
+  if command -v rg >/dev/null 2>&1; then
+    rg -qi "$pattern" "$log_file"
+  else
+    grep -Eqi "$pattern" "$log_file"
+  fi
+}
+
+run_with_auto_batch_retry() {
+  local stage_name="$1"
+  local batch_var_name="$2"
+  shift 2
+  local -a stage_cmd=("$@")
+  local batch_size="${!batch_var_name}"
+  local try_i=1
+
+  while true; do
+    local log_file
+    log_file="$(mktemp "/tmp/omnigraph_${stage_name}_bs${batch_size}_XXXX.log")"
+    echo "[${stage_name}] launch batch_size=${batch_size} (try ${try_i}/${AUTO_BATCH_MAX_RETRIES})"
+
+    set +e
+    "${stage_cmd[@]}" --batch_size "$batch_size" 2>&1 | tee "$log_file"
+    local rc=${PIPESTATUS[0]}
+    set -e
+
+    if [ "$rc" -eq 0 ]; then
+      printf -v "$batch_var_name" "%s" "$batch_size"
+      echo "[${stage_name}] success batch_size=${batch_size}"
+      return 0
+    fi
+
+    if [ "$AUTO_BATCH_RETRY_ON_OOM" != "1" ]; then
+      echo "[${stage_name}] failed (rc=${rc}), auto OOM retry disabled. log=${log_file}"
+      return "$rc"
+    fi
+    if ! is_oom_log_file "$log_file"; then
+      echo "[${stage_name}] failed (non-OOM, rc=${rc}). log=${log_file}"
+      return "$rc"
+    fi
+    if [ "$batch_size" -le 1 ]; then
+      echo "[${stage_name}] OOM even at batch_size=1. log=${log_file}"
+      return "$rc"
+    fi
+    if [ "$try_i" -ge "$AUTO_BATCH_MAX_RETRIES" ]; then
+      echo "[${stage_name}] reached retry limit (${AUTO_BATCH_MAX_RETRIES}). last log=${log_file}"
+      return "$rc"
+    fi
+
+    local next_batch=$(( (batch_size * 2 + 2) / 3 ))
+    if [ "$next_batch" -ge "$batch_size" ]; then
+      next_batch=$((batch_size - 1))
+    fi
+    if [ "$next_batch" -lt 1 ]; then
+      next_batch=1
+    fi
+    echo "[${stage_name}] OOM detected, reduce batch_size ${batch_size} -> ${next_batch}"
+    batch_size="$next_batch"
+    try_i=$((try_i + 1))
+  done
+}
+
 echo "[Config] LOW_VRAM_4090=${LOW_VRAM_4090} LLM_MODEL=${LLM_MODEL} VISION_MODEL=${VISION_MODEL}"
 echo "[Config] AUTO_BATCH_BY_VRAM=${AUTO_BATCH_BY_VRAM} detected_vram_gb=${GPU_VRAM_GB}"
+echo "[Config] AUTO_BATCH_RETRY_ON_OOM=${AUTO_BATCH_RETRY_ON_OOM} AUTO_BATCH_MAX_RETRIES=${AUTO_BATCH_MAX_RETRIES}"
+if [ "$AUTO_BATCH_BY_VRAM" = "1" ]; then
+  if [ -n "${USER_SET_S2A_BATCH_SIZE:-}" ]; then echo "[Config] manual S2A_BATCH_SIZE=${S2A_BATCH_SIZE} -> skip auto init for Stage2A"; fi
+  if [ -n "${USER_SET_S2B_BATCH_SIZE:-}" ]; then echo "[Config] manual S2B_BATCH_SIZE=${S2B_BATCH_SIZE} -> skip auto init for Stage2B"; fi
+  if [ -n "${USER_SET_S3_BATCH_SIZE:-}" ]; then echo "[Config] manual S3_BATCH_SIZE=${S3_BATCH_SIZE} -> skip auto init for Stage3"; fi
+  if [ -n "${USER_SET_S2B_R2_BATCH_SIZE:-}" ]; then echo "[Config] manual S2B_R2_BATCH_SIZE=${S2B_R2_BATCH_SIZE} -> skip auto init for Stage2B-R2"; fi
+  if [ -n "${USER_SET_S3_R2_BATCH_SIZE:-}" ]; then echo "[Config] manual S3_R2_BATCH_SIZE=${S3_R2_BATCH_SIZE} -> skip auto init for Stage3-R2"; fi
+fi
 echo "[Config] LLM_DTYPE=${LLM_DTYPE} LLM_ATTN_IMPL=${LLM_ATTN_IMPL}"
 echo "[Config] NODE_ENCODER_TYPE=${NODE_ENCODER_TYPE} ALPHA=${NODE_ENCODER_ALPHA_INIT} OUT_DIM=${NODE_ENCODER_OUT_DIM}"
 echo "[Config] S2A bs=${S2A_BATCH_SIZE} max_len=${S2A_MAX_LENGTH} workers=${S2A_NUM_WORKERS} prec=${S2A_PRECISION}"
@@ -282,7 +358,7 @@ S2A_EXTRA_ARGS=()
 if [ "$S2A_FREEZE_VG_ADAPTER" = "1" ]; then
   S2A_EXTRA_ARGS+=(--freeze_vg_adapter)
 fi
-"$PYTHON_BIN" "$REPO/omnigraph/train/train_projector.py" \
+S2A_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_projector.py" \
   --scene_graphs "$VG_SCENE_GRAPHS" \
   --regions "$VG_REGIONS" \
   --stage1_qformer_ckpt "$STAGE1_QFORMER_CKPT" \
@@ -296,7 +372,6 @@ fi
   --graph_qa_max_per_image 5 \
   --graph_qa_repeat 3 \
   --gpu "$GPU" \
-  --batch_size "$S2A_BATCH_SIZE" \
   --precision "$S2A_PRECISION" \
   --max_length "$S2A_MAX_LENGTH" \
   --max_graph_tokens "$S2A_MAX_GRAPH_TOKENS" \
@@ -311,7 +386,8 @@ fi
   --val_check_interval "$S2A_VAL_CHECK_INTERVAL" \
   --limit_val_batches "$S2A_LIMIT_VAL_BATCHES" \
   "${S2A_EXTRA_ARGS[@]}" \
-  --save_dir "$STAGE2A_DIR"
+  --save_dir "$STAGE2A_DIR")
+run_with_auto_batch_retry "Stage2A" "S2A_BATCH_SIZE" "${S2A_CMD[@]}"
 
 STAGE2A_CKPT=$("$PYTHON_BIN" "$SELECT_CKPT" \
   --meta "$STAGE2A_DIR/stage2A_meta.json" \
@@ -324,7 +400,7 @@ S2B_EXTRA_ARGS=()
 if [ "$S2B_FREEZE_VG_ADAPTER" = "1" ]; then
   S2B_EXTRA_ARGS+=(--freeze_vg_adapter)
 fi
-"$PYTHON_BIN" "$REPO/omnigraph/train/train_stage2B.py" \
+S2B_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_stage2B.py" \
   --scene_graphs "$VG_SCENE_GRAPHS" \
   --regions "$VG_REGIONS" \
   --stage2A_ckpt "$STAGE2A_CKPT" \
@@ -338,7 +414,6 @@ fi
   --graph_qa_max_per_image 6 \
   --graph_qa_repeat 4 \
   --gpu "$GPU" \
-  --batch_size "$S2B_BATCH_SIZE" \
   --precision "$S2B_PRECISION" \
   --max_length "$S2B_MAX_LENGTH" \
   --max_graph_tokens "$S2B_MAX_GRAPH_TOKENS" \
@@ -353,7 +428,8 @@ fi
   --patience 16 \
   --min_delta 0.0005 \
   "${S2B_EXTRA_ARGS[@]}" \
-  --save_dir "$STAGE2B_DIR"
+  --save_dir "$STAGE2B_DIR")
+run_with_auto_batch_retry "Stage2B" "S2B_BATCH_SIZE" "${S2B_CMD[@]}"
 
 STAGE2B_CKPT=$("$PYTHON_BIN" "$SELECT_CKPT" \
   --meta "$STAGE2B_DIR/stage2B_meta.json" \
@@ -362,7 +438,7 @@ echo "[Stage2B] using ckpt: $STAGE2B_CKPT"
 test -f "$STAGE2B_CKPT"
 
 echo "[Stage3] start"
-"$PYTHON_BIN" "$REPO/omnigraph/train/train_stage3.py" \
+S3_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_stage3.py" \
   --scene_graphs "$VG_SCENE_GRAPHS" \
   --regions "$VG_REGIONS" \
   --image_root "$VG_IMAGE_ROOT" \
@@ -378,7 +454,6 @@ echo "[Stage3] start"
   --graph_qa_max_per_image 4 \
   --graph_qa_repeat 2 \
   --gpu "$GPU" \
-  --batch_size "$S3_BATCH_SIZE" \
   --precision "$S3_PRECISION" \
   --max_length "$S3_MAX_LENGTH" \
   --max_graph_tokens "$S3_MAX_GRAPH_TOKENS" \
@@ -393,7 +468,8 @@ echo "[Stage3] start"
   --limit_val_batches "$S3_LIMIT_VAL_BATCHES" \
   --patience 14 \
   --min_delta 0.0005 \
-  --save_dir "$STAGE3_DIR"
+  --save_dir "$STAGE3_DIR")
+run_with_auto_batch_retry "Stage3" "S3_BATCH_SIZE" "${S3_CMD[@]}"
 
 echo "[GQA] prepare converted files"
 if [ ! -f "$GQA_SCENE_VG" ]; then
@@ -524,7 +600,7 @@ S2B_R2_EXTRA_ARGS=()
 if [ "$S2B_R2_FREEZE_VG_ADAPTER" = "1" ]; then
   S2B_R2_EXTRA_ARGS+=(--freeze_vg_adapter)
 fi
-"$PYTHON_BIN" "$REPO/omnigraph/train/train_stage2B.py" \
+S2B_R2_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_stage2B.py" \
   --scene_graphs "$VG_SCENE_GRAPHS" \
   --regions "$VG_REGIONS" \
   --stage2A_ckpt "$STAGE2A_CKPT" \
@@ -538,7 +614,6 @@ fi
   --graph_qa_max_per_image 8 \
   --graph_qa_repeat 5 \
   --gpu "$GPU" \
-  --batch_size "$S2B_R2_BATCH_SIZE" \
   --precision "$S2B_R2_PRECISION" \
   --max_length "$S2B_R2_MAX_LENGTH" \
   --max_graph_tokens "$S2B_R2_MAX_GRAPH_TOKENS" \
@@ -553,7 +628,8 @@ fi
   --patience 20 \
   --min_delta 0.0003 \
   "${S2B_R2_EXTRA_ARGS[@]}" \
-  --save_dir "$STAGE2B_R2_DIR"
+  --save_dir "$STAGE2B_R2_DIR")
+run_with_auto_batch_retry "Stage2B-R2" "S2B_R2_BATCH_SIZE" "${S2B_R2_CMD[@]}"
 
 STAGE2B_R2_CKPT=$("$PYTHON_BIN" "$SELECT_CKPT" \
   --meta "$STAGE2B_R2_DIR/stage2B_meta.json" \
@@ -561,7 +637,7 @@ STAGE2B_R2_CKPT=$("$PYTHON_BIN" "$SELECT_CKPT" \
 echo "[Round2] Stage2B ckpt: $STAGE2B_R2_CKPT"
 test -f "$STAGE2B_R2_CKPT"
 
-"$PYTHON_BIN" "$REPO/omnigraph/train/train_stage3.py" \
+S3_R2_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_stage3.py" \
   --scene_graphs "$VG_SCENE_GRAPHS" \
   --regions "$VG_REGIONS" \
   --image_root "$VG_IMAGE_ROOT" \
@@ -577,7 +653,6 @@ test -f "$STAGE2B_R2_CKPT"
   --graph_qa_max_per_image 5 \
   --graph_qa_repeat 3 \
   --gpu "$GPU" \
-  --batch_size "$S3_R2_BATCH_SIZE" \
   --precision "$S3_R2_PRECISION" \
   --max_length "$S3_R2_MAX_LENGTH" \
   --max_graph_tokens "$S3_R2_MAX_GRAPH_TOKENS" \
@@ -592,7 +667,8 @@ test -f "$STAGE2B_R2_CKPT"
   --limit_val_batches "$S3_R2_LIMIT_VAL_BATCHES" \
   --patience 18 \
   --min_delta 0.0003 \
-  --save_dir "$STAGE3_R2_DIR"
+  --save_dir "$STAGE3_R2_DIR")
+run_with_auto_batch_retry "Stage3-R2" "S3_R2_BATCH_SIZE" "${S3_R2_CMD[@]}"
 
 "$PYTHON_BIN" "$REPO/scripts/eval/infer_gqa.py" \
   --questions "$GQA_QUESTIONS_JSONL" \
