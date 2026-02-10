@@ -13,6 +13,7 @@ REPO=${REPO:-"$WORKDIR"}
 GPU=${GPU:-0}
 ISOLATE_GPU=${ISOLATE_GPU:-1}
 ORIG_GPU=${GPU}
+AUTO_BATCH_BY_VRAM=${AUTO_BATCH_BY_VRAM:-1}
 if [ "$ISOLATE_GPU" = "1" ]; then
   export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-$GPU}
   GPU=0
@@ -30,6 +31,13 @@ QUERY_SPRINT_TARGET=${QUERY_SPRINT_TARGET:-0.2800}
 RUN_ROUND2_ON_FAIL=${RUN_ROUND2_ON_FAIL:-1}
 INSTALL_DEPS=${INSTALL_DEPS:-0}
 LOW_VRAM_4090=${LOW_VRAM_4090:-1}
+
+# Keep track of whether user explicitly set batch size env vars.
+USER_SET_S2A_BATCH_SIZE=${S2A_BATCH_SIZE+x}
+USER_SET_S2B_BATCH_SIZE=${S2B_BATCH_SIZE+x}
+USER_SET_S3_BATCH_SIZE=${S3_BATCH_SIZE+x}
+USER_SET_S2B_R2_BATCH_SIZE=${S2B_R2_BATCH_SIZE+x}
+USER_SET_S3_R2_BATCH_SIZE=${S3_R2_BATCH_SIZE+x}
 
 DEFAULT_LLM_7B="Qwen/Qwen2.5-7B-Instruct"
 DEFAULT_LLM_3B="Qwen/Qwen2.5-3B-Instruct"
@@ -53,6 +61,8 @@ if [ "$LOW_VRAM_4090" = "1" ]; then
   : "${S2A_PRECISION:=16-mixed}"
   : "${S2A_ACCUM_GRAD_BATCHES:=4}"
   : "${S2A_NUM_SANITY_VAL_STEPS:=0}"
+  : "${S2A_VAL_CHECK_INTERVAL:=5000}"
+  : "${S2A_LIMIT_VAL_BATCHES:=0.002}"
   : "${S2A_FREEZE_VG_ADAPTER:=0}"
   : "${S2A_TRAIN_NODE_ENCODER:=1}"
 
@@ -63,6 +73,8 @@ if [ "$LOW_VRAM_4090" = "1" ]; then
   : "${S2B_PRECISION:=16-mixed}"
   : "${S2B_ACCUM_GRAD_BATCHES:=4}"
   : "${S2B_NUM_SANITY_VAL_STEPS:=0}"
+  : "${S2B_VAL_CHECK_INTERVAL:=5000}"
+  : "${S2B_LIMIT_VAL_BATCHES:=0.002}"
   : "${S2B_FREEZE_VG_ADAPTER:=0}"
   : "${S2B_TRAIN_NODE_ENCODER:=1}"
 
@@ -74,6 +86,8 @@ if [ "$LOW_VRAM_4090" = "1" ]; then
   : "${S3_PRECISION:=16-mixed}"
   : "${S3_ACCUM_GRAD_BATCHES:=4}"
   : "${S3_NUM_SANITY_VAL_STEPS:=0}"
+  : "${S3_VAL_CHECK_INTERVAL:=5000}"
+  : "${S3_LIMIT_VAL_BATCHES:=0.002}"
   : "${S3_TRAIN_NODE_ENCODER:=0}"
 
   : "${S2B_R2_BATCH_SIZE:=1}"
@@ -83,6 +97,8 @@ if [ "$LOW_VRAM_4090" = "1" ]; then
   : "${S2B_R2_PRECISION:=16-mixed}"
   : "${S2B_R2_ACCUM_GRAD_BATCHES:=4}"
   : "${S2B_R2_NUM_SANITY_VAL_STEPS:=0}"
+  : "${S2B_R2_VAL_CHECK_INTERVAL:=5000}"
+  : "${S2B_R2_LIMIT_VAL_BATCHES:=0.002}"
   : "${S2B_R2_FREEZE_VG_ADAPTER:=0}"
   : "${S2B_R2_TRAIN_NODE_ENCODER:=1}"
 
@@ -94,6 +110,8 @@ if [ "$LOW_VRAM_4090" = "1" ]; then
   : "${S3_R2_PRECISION:=16-mixed}"
   : "${S3_R2_ACCUM_GRAD_BATCHES:=4}"
   : "${S3_R2_NUM_SANITY_VAL_STEPS:=0}"
+  : "${S3_R2_VAL_CHECK_INTERVAL:=5000}"
+  : "${S3_R2_LIMIT_VAL_BATCHES:=0.002}"
   : "${S3_R2_TRAIN_NODE_ENCODER:=0}"
 else
   : "${S2A_BATCH_SIZE:=3}"
@@ -103,6 +121,8 @@ else
   : "${S2A_PRECISION:=16-mixed}"
   : "${S2A_ACCUM_GRAD_BATCHES:=4}"
   : "${S2A_NUM_SANITY_VAL_STEPS:=0}"
+  : "${S2A_VAL_CHECK_INTERVAL:=5000}"
+  : "${S2A_LIMIT_VAL_BATCHES:=0.002}"
   : "${S2A_FREEZE_VG_ADAPTER:=0}"
   : "${S2A_TRAIN_NODE_ENCODER:=1}"
 
@@ -113,6 +133,8 @@ else
   : "${S2B_PRECISION:=16-mixed}"
   : "${S2B_ACCUM_GRAD_BATCHES:=4}"
   : "${S2B_NUM_SANITY_VAL_STEPS:=0}"
+  : "${S2B_VAL_CHECK_INTERVAL:=5000}"
+  : "${S2B_LIMIT_VAL_BATCHES:=0.002}"
   : "${S2B_FREEZE_VG_ADAPTER:=0}"
   : "${S2B_TRAIN_NODE_ENCODER:=1}"
 
@@ -124,6 +146,8 @@ else
   : "${S3_PRECISION:=16-mixed}"
   : "${S3_ACCUM_GRAD_BATCHES:=4}"
   : "${S3_NUM_SANITY_VAL_STEPS:=0}"
+  : "${S3_VAL_CHECK_INTERVAL:=5000}"
+  : "${S3_LIMIT_VAL_BATCHES:=0.002}"
   : "${S3_TRAIN_NODE_ENCODER:=0}"
 
   : "${S2B_R2_BATCH_SIZE:=3}"
@@ -133,6 +157,8 @@ else
   : "${S2B_R2_PRECISION:=16-mixed}"
   : "${S2B_R2_ACCUM_GRAD_BATCHES:=4}"
   : "${S2B_R2_NUM_SANITY_VAL_STEPS:=0}"
+  : "${S2B_R2_VAL_CHECK_INTERVAL:=5000}"
+  : "${S2B_R2_LIMIT_VAL_BATCHES:=0.002}"
   : "${S2B_R2_FREEZE_VG_ADAPTER:=0}"
   : "${S2B_R2_TRAIN_NODE_ENCODER:=1}"
 
@@ -144,6 +170,8 @@ else
   : "${S3_R2_PRECISION:=16-mixed}"
   : "${S3_R2_ACCUM_GRAD_BATCHES:=4}"
   : "${S3_R2_NUM_SANITY_VAL_STEPS:=0}"
+  : "${S3_R2_VAL_CHECK_INTERVAL:=5000}"
+  : "${S3_R2_LIMIT_VAL_BATCHES:=0.002}"
   : "${S3_R2_TRAIN_NODE_ENCODER:=0}"
 fi
 
@@ -187,12 +215,59 @@ if ! "$PYTHON_BIN" -c "import torch, pytorch_lightning as pl" >/dev/null 2>&1; t
   fi
 fi
 "$PYTHON_BIN" -c "import torch, pytorch_lightning as pl; print('torch', torch.__version__); print('cuda', torch.cuda.is_available()); print('gpu', torch.cuda.get_device_name(${GPU}) if torch.cuda.is_available() else 'cpu')"
+
+GPU_VRAM_GB="unknown"
+if [ "$AUTO_BATCH_BY_VRAM" = "1" ]; then
+  read -r GPU_VRAM_GB AUTO_S2A_BATCH AUTO_S2B_BATCH AUTO_S3_BATCH AUTO_S2B_R2_BATCH AUTO_S3_R2_BATCH <<<"$(
+    GPU="$GPU" "$PYTHON_BIN" - <<'PY'
+import os
+import torch
+
+gpu = int(os.environ.get("GPU", "0"))
+
+if not torch.cuda.is_available():
+    print("0.0 1 1 1 1 1")
+    raise SystemExit(0)
+
+if gpu < 0 or gpu >= torch.cuda.device_count():
+    gpu = 0
+
+gb = float(torch.cuda.get_device_properties(gpu).total_memory) / (1024 ** 3)
+
+# Conservative stage-wise defaults:
+# Stage3 is vision+graph+text, keep lower than Stage2A/2B on same VRAM.
+if gb < 16:
+    s2a, s2b, s3 = 1, 1, 1
+elif gb < 30:
+    s2a, s2b, s3 = 1, 1, 1
+elif gb < 40:
+    s2a, s2b, s3 = 2, 2, 1
+elif gb < 56:
+    s2a, s2b, s3 = 3, 3, 2
+elif gb < 80:
+    s2a, s2b, s3 = 4, 4, 2
+else:
+    s2a, s2b, s3 = 6, 6, 3
+
+print(f"{gb:.1f} {s2a} {s2b} {s3} {s2b} {s3}")
+PY
+  )"
+
+  if [ -z "${USER_SET_S2A_BATCH_SIZE:-}" ]; then S2A_BATCH_SIZE="$AUTO_S2A_BATCH"; fi
+  if [ -z "${USER_SET_S2B_BATCH_SIZE:-}" ]; then S2B_BATCH_SIZE="$AUTO_S2B_BATCH"; fi
+  if [ -z "${USER_SET_S3_BATCH_SIZE:-}" ]; then S3_BATCH_SIZE="$AUTO_S3_BATCH"; fi
+  if [ -z "${USER_SET_S2B_R2_BATCH_SIZE:-}" ]; then S2B_R2_BATCH_SIZE="$AUTO_S2B_R2_BATCH"; fi
+  if [ -z "${USER_SET_S3_R2_BATCH_SIZE:-}" ]; then S3_R2_BATCH_SIZE="$AUTO_S3_R2_BATCH"; fi
+fi
+
 echo "[Config] LOW_VRAM_4090=${LOW_VRAM_4090} LLM_MODEL=${LLM_MODEL} VISION_MODEL=${VISION_MODEL}"
+echo "[Config] AUTO_BATCH_BY_VRAM=${AUTO_BATCH_BY_VRAM} detected_vram_gb=${GPU_VRAM_GB}"
 echo "[Config] LLM_DTYPE=${LLM_DTYPE} LLM_ATTN_IMPL=${LLM_ATTN_IMPL}"
 echo "[Config] NODE_ENCODER_TYPE=${NODE_ENCODER_TYPE} ALPHA=${NODE_ENCODER_ALPHA_INIT} OUT_DIM=${NODE_ENCODER_OUT_DIM}"
 echo "[Config] S2A bs=${S2A_BATCH_SIZE} max_len=${S2A_MAX_LENGTH} workers=${S2A_NUM_WORKERS} prec=${S2A_PRECISION}"
 echo "[Config] S2B bs=${S2B_BATCH_SIZE} max_len=${S2B_MAX_LENGTH} workers=${S2B_NUM_WORKERS} prec=${S2B_PRECISION}"
 echo "[Config] S3  bs=${S3_BATCH_SIZE} max_len=${S3_MAX_LENGTH} workers=${S3_NUM_WORKERS} prec=${S3_PRECISION}"
+echo "[Config] val: S2A(interval=${S2A_VAL_CHECK_INTERVAL},limit=${S2A_LIMIT_VAL_BATCHES}) S2B(interval=${S2B_VAL_CHECK_INTERVAL},limit=${S2B_LIMIT_VAL_BATCHES}) S3(interval=${S3_VAL_CHECK_INTERVAL},limit=${S3_LIMIT_VAL_BATCHES})"
 echo "[Config] freeze_vg_adapter: S2A=${S2A_FREEZE_VG_ADAPTER} S2B=${S2B_FREEZE_VG_ADAPTER} S2B_R2=${S2B_R2_FREEZE_VG_ADAPTER}"
 echo "[Config] train_node_encoder: S2A=${S2A_TRAIN_NODE_ENCODER} S2B=${S2B_TRAIN_NODE_ENCODER} S3=${S3_TRAIN_NODE_ENCODER} S2B_R2=${S2B_R2_TRAIN_NODE_ENCODER} S3_R2=${S3_R2_TRAIN_NODE_ENCODER}"
 test -f "$STAGE1_QFORMER_CKPT"
@@ -233,7 +308,8 @@ fi
   --min_delta 0.0005 \
   --lr 3e-5 \
   --max_steps 120000 \
-  --val_check_interval 1000 \
+  --val_check_interval "$S2A_VAL_CHECK_INTERVAL" \
+  --limit_val_batches "$S2A_LIMIT_VAL_BATCHES" \
   "${S2A_EXTRA_ARGS[@]}" \
   --save_dir "$STAGE2A_DIR"
 
@@ -272,7 +348,8 @@ fi
   --lr 1.2e-5 \
   --max_steps 60000 \
   --val_ratio 0.02 \
-  --val_check_interval 1000 \
+  --val_check_interval "$S2B_VAL_CHECK_INTERVAL" \
+  --limit_val_batches "$S2B_LIMIT_VAL_BATCHES" \
   --patience 16 \
   --min_delta 0.0005 \
   "${S2B_EXTRA_ARGS[@]}" \
@@ -312,7 +389,8 @@ echo "[Stage3] start"
   --lr 2e-5 \
   --max_steps 50000 \
   --val_ratio 0.02 \
-  --val_check_interval 1000 \
+  --val_check_interval "$S3_VAL_CHECK_INTERVAL" \
+  --limit_val_batches "$S3_LIMIT_VAL_BATCHES" \
   --patience 14 \
   --min_delta 0.0005 \
   --save_dir "$STAGE3_DIR"
@@ -470,7 +548,8 @@ fi
   --lr 8e-6 \
   --max_steps 80000 \
   --val_ratio 0.02 \
-  --val_check_interval 1000 \
+  --val_check_interval "$S2B_R2_VAL_CHECK_INTERVAL" \
+  --limit_val_batches "$S2B_R2_LIMIT_VAL_BATCHES" \
   --patience 20 \
   --min_delta 0.0003 \
   "${S2B_R2_EXTRA_ARGS[@]}" \
@@ -509,7 +588,8 @@ test -f "$STAGE2B_R2_CKPT"
   --lr 1.5e-5 \
   --max_steps 70000 \
   --val_ratio 0.02 \
-  --val_check_interval 1000 \
+  --val_check_interval "$S3_R2_VAL_CHECK_INTERVAL" \
+  --limit_val_batches "$S3_R2_LIMIT_VAL_BATCHES" \
   --patience 18 \
   --min_delta 0.0003 \
   --save_dir "$STAGE3_R2_DIR"
