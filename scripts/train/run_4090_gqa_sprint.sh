@@ -30,7 +30,7 @@ QUERY_TARGET=${QUERY_TARGET:-0.2600}
 QUERY_SPRINT_TARGET=${QUERY_SPRINT_TARGET:-0.2800}
 RUN_ROUND2_ON_FAIL=${RUN_ROUND2_ON_FAIL:-1}
 INSTALL_DEPS=${INSTALL_DEPS:-0}
-LOW_VRAM_4090=${LOW_VRAM_4090:-1}
+LOW_VRAM_4090=${LOW_VRAM_4090:-0}
 AUTO_BATCH_RETRY_ON_OOM=${AUTO_BATCH_RETRY_ON_OOM:-1}
 AUTO_BATCH_MAX_RETRIES=${AUTO_BATCH_MAX_RETRIES:-8}
 
@@ -43,7 +43,7 @@ USER_SET_S3_R2_BATCH_SIZE=${S3_R2_BATCH_SIZE+x}
 
 DEFAULT_LLM_7B="Qwen/Qwen2.5-7B-Instruct"
 DEFAULT_LLM_3B="Qwen/Qwen2.5-3B-Instruct"
-LLM_MODEL=${LLM_MODEL:-$DEFAULT_LLM_7B}
+LLM_MODEL=${LLM_MODEL:-$DEFAULT_LLM_3B}
 LLM_DTYPE=${LLM_DTYPE:-bfloat16}
 LLM_ATTN_IMPL=${LLM_ATTN_IMPL:-sdpa}
 VISION_MODEL=${VISION_MODEL:-Salesforce/blip2-flan-t5-xl}
@@ -116,7 +116,7 @@ if [ "$LOW_VRAM_4090" = "1" ]; then
   : "${S3_R2_LIMIT_VAL_BATCHES:=0.002}"
   : "${S3_R2_TRAIN_NODE_ENCODER:=0}"
 else
-  : "${S2A_BATCH_SIZE:=3}"
+  : "${S2A_BATCH_SIZE:=12}"
   : "${S2A_MAX_LENGTH:=256}"
   : "${S2A_MAX_GRAPH_TOKENS:=32}"
   : "${S2A_NUM_WORKERS:=8}"
@@ -128,7 +128,7 @@ else
   : "${S2A_FREEZE_VG_ADAPTER:=0}"
   : "${S2A_TRAIN_NODE_ENCODER:=1}"
 
-  : "${S2B_BATCH_SIZE:=3}"
+  : "${S2B_BATCH_SIZE:=12}"
   : "${S2B_MAX_LENGTH:=256}"
   : "${S2B_MAX_GRAPH_TOKENS:=32}"
   : "${S2B_NUM_WORKERS:=8}"
@@ -140,7 +140,7 @@ else
   : "${S2B_FREEZE_VG_ADAPTER:=0}"
   : "${S2B_TRAIN_NODE_ENCODER:=1}"
 
-  : "${S3_BATCH_SIZE:=2}"
+  : "${S3_BATCH_SIZE:=6}"
   : "${S3_MAX_LENGTH:=256}"
   : "${S3_MAX_GRAPH_TOKENS:=32}"
   : "${S3_MAX_VISION_TOKENS:=32}"
@@ -152,7 +152,7 @@ else
   : "${S3_LIMIT_VAL_BATCHES:=0.002}"
   : "${S3_TRAIN_NODE_ENCODER:=0}"
 
-  : "${S2B_R2_BATCH_SIZE:=3}"
+  : "${S2B_R2_BATCH_SIZE:=12}"
   : "${S2B_R2_MAX_LENGTH:=256}"
   : "${S2B_R2_MAX_GRAPH_TOKENS:=32}"
   : "${S2B_R2_NUM_WORKERS:=8}"
@@ -164,7 +164,7 @@ else
   : "${S2B_R2_FREEZE_VG_ADAPTER:=0}"
   : "${S2B_R2_TRAIN_NODE_ENCODER:=1}"
 
-  : "${S3_R2_BATCH_SIZE:=2}"
+  : "${S3_R2_BATCH_SIZE:=6}"
   : "${S3_R2_MAX_LENGTH:=256}"
   : "${S3_R2_MAX_GRAPH_TOKENS:=32}"
   : "${S3_R2_MAX_VISION_TOKENS:=32}"
@@ -252,16 +252,16 @@ is_7b = ("7b" in llm_model)
 if gb < 16:
     s2a, s2b, s3 = 1, 1, 1
 elif gb < 24:
-    s2a, s2b, s3 = 2, 2, 1
+  s2a, s2b, s3 = 4, 4, 2
 elif gb < 30:
-    if is_3b and s2a_max_len <= 96 and s2b_max_len <= 96 and s3_max_len <= 96:
-        s2a, s2b, s3 = 12, 12, 6
-    elif is_3b:
-        s2a, s2b, s3 = 8, 8, 4
-    elif is_7b:
-        s2a, s2b, s3 = 6, 6, 3
-    else:
-        s2a, s2b, s3 = 8, 8, 4
+  if is_3b and s2a_max_len <= 96 and s2b_max_len <= 96 and s3_max_len <= 96:
+    s2a, s2b, s3 = 16, 16, 8
+  elif is_3b:
+    s2a, s2b, s3 = 10, 10, 5
+  elif is_7b:
+    s2a, s2b, s3 = 6, 6, 3
+  else:
+    s2a, s2b, s3 = 8, 8, 4
 elif gb < 40:
     if is_7b:
         s2a, s2b, s3 = 8, 8, 4
@@ -273,6 +273,11 @@ elif gb < 80:
     s2a, s2b, s3 = 8, 8, 4
 else:
     s2a, s2b, s3 = 10, 10, 6
+
+max_bs = int(os.environ.get("MAX_AUTO_BATCH", "64"))
+s2a = min(s2a, max_bs)
+s2b = min(s2b, max_bs)
+s3 = min(s3, max_bs)
 
 print(f"{gb:.1f} {s2a} {s2b} {s3} {s2b} {s3}")
 PY

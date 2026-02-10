@@ -21,10 +21,10 @@ SAVE_DIR=${SAVE_DIR:-checkpoints_projector_vg/stage2A_paper}
   --graph_qa_max_per_image 5 \
   --graph_qa_repeat 3 \
   --gpu "$GPU" \
-  --batch_size 3 \
+  --batch_size 1 \
   --precision 16 \
   --max_length 256 \
-  --num_workers 8 \
+  --num_workers 0 \
   --val_ratio 0.02 \
   --patience 16 \
   --min_delta 0.0005 \
