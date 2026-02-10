@@ -505,6 +505,14 @@ class Stage3PL(pl.LightningModule):
         lr: float,
         max_length: int,
         stage2B_ckpt: str,
+        max_graph_tokens: int | None = None,
+        max_vision_tokens: int | None = None,
+        llm_dtype: str = "bfloat16",
+        llm_attn_implementation: str = "sdpa",
+        node_encoder_type: str = "hybrid",
+        node_encoder_out_dim: int = 128,
+        train_node_encoder: bool = False,
+        node_encoder_alpha_init: float = 0.3,
         auto_resize_token_embeddings: bool = True,
     ):
         super().__init__()
@@ -517,14 +525,31 @@ class Stage3PL(pl.LightningModule):
             enable_vision=True,
             num_obj=int(num_obj),
             num_attr=int(num_attr),
+            max_graph_tokens=max_graph_tokens,
+            max_vision_tokens=max_vision_tokens,
+            llm_dtype=llm_dtype,
+            llm_attn_implementation=llm_attn_implementation,
+            node_encoder_type=node_encoder_type,
+            node_encoder_out_dim=int(node_encoder_out_dim),
+            node_encoder_trainable=bool(train_node_encoder),
+            node_encoder_alpha_init=float(node_encoder_alpha_init),
         )
 
         # strict pipeline: Stage3 always initializes from Stage2B ckpt
         self.stage2B_provenance = load_stage2b_weights_only_into_model(self.model, stage2B_ckpt)
 
         # Freeze everything except projectors
+        self.train_node_encoder = bool(train_node_encoder)
         for name, p in self.model.named_parameters():
-            p.requires_grad = ("gl_projector" in name) or ("vl_projector" in name)
+            p.requires_grad = (
+                ("gl_projector" in name)
+                or ("vl_projector" in name)
+                or (self.train_node_encoder and (name.startswith("node_encoder.") or ("vg_adapter" in name)))
+            )
+        print(
+            f"[Stage3] node_encoder_type={self.model.node_encoder_type} "
+            f"train_node_encoder={self.train_node_encoder}"
+        )
 
         # LLM memory-saving knobs
         if hasattr(self.model.llm.model, "gradient_checkpointing_enable"):
@@ -616,6 +641,13 @@ def _parse_val_check_interval(x: float) -> float | int:
     return x
 
 
+def _parse_precision(v: str) -> int | str:
+    s = str(v).strip()
+    if s.lstrip("-").isdigit():
+        return int(s)
+    return s
+
+
 def main():
     ap = argparse.ArgumentParser()
 
@@ -633,8 +665,16 @@ def main():
     ap.add_argument("--batch_size", type=int, default=2)
     ap.add_argument("--num_workers", type=int, default=4)
 
-    ap.add_argument("--precision", type=int, default=32)
+    ap.add_argument("--precision", type=str, default="32")
     ap.add_argument("--max_length", type=int, default=256)
+    ap.add_argument("--max_graph_tokens", type=int, default=0, help="If >0, truncate graph prefix tokens before LLM.")
+    ap.add_argument("--max_vision_tokens", type=int, default=0, help="If >0, truncate vision prefix tokens before LLM.")
+    ap.add_argument("--llm_dtype", type=str, default="bfloat16", help="LLM load dtype: bfloat16/float16/float32.")
+    ap.add_argument("--llm_attn_implementation", type=str, default="sdpa", help="LLM attention backend (e.g., sdpa/flash_attention_2).")
+    ap.add_argument("--node_encoder_type", type=str, default="hybrid", choices=["hybrid", "open_vocab", "legacy_vg"])
+    ap.add_argument("--node_encoder_out_dim", type=int, default=128, help="Graph node encoder output dim.")
+    ap.add_argument("--train_node_encoder", type=int, default=0, choices=[0, 1], help="1=train node encoder, 0=freeze.")
+    ap.add_argument("--node_encoder_alpha_init", type=float, default=0.3, help="Hybrid node encoder alpha init.")
 
     ap.add_argument("--lr", type=float, default=5e-5)
     ap.add_argument("--max_steps", type=int, default=20000)
@@ -648,6 +688,8 @@ def main():
     ap.add_argument("--val_check_interval", type=float, default=2000,
                     help=">=1: validate every N steps; (0,1]: validate every fraction of epoch")
     ap.add_argument("--limit_val_batches", type=float, default=1.0)
+    ap.add_argument("--num_sanity_val_steps", type=int, default=0)
+    ap.add_argument("--accumulate_grad_batches", type=int, default=4)
 
     ap.add_argument("--save_dir", type=str, default="checkpoints_stage3")
 
@@ -758,6 +800,14 @@ def main():
         lr=float(args.lr),
         max_length=int(args.max_length),
         stage2B_ckpt=str(args.stage2B_ckpt),
+        max_graph_tokens=(int(args.max_graph_tokens) if int(args.max_graph_tokens) > 0 else None),
+        max_vision_tokens=(int(args.max_vision_tokens) if int(args.max_vision_tokens) > 0 else None),
+        llm_dtype=str(args.llm_dtype),
+        llm_attn_implementation=str(args.llm_attn_implementation),
+        node_encoder_type=str(args.node_encoder_type),
+        node_encoder_out_dim=int(args.node_encoder_out_dim),
+        train_node_encoder=bool(int(args.train_node_encoder)),
+        node_encoder_alpha_init=float(args.node_encoder_alpha_init),
         auto_resize_token_embeddings=True,
     )
 
@@ -789,17 +839,19 @@ def main():
     trainer = pl.Trainer(
         accelerator="gpu" if use_gpu else "cpu",
         devices=devices,
-        precision=int(args.precision),
+        precision=_parse_precision(args.precision),
         max_steps=int(args.max_steps),
         max_epochs=999999,  # controlled by max_steps + early stopping
         callbacks=[ckpt_cb, lr_monitor, es],
         log_every_n_steps=10,
         gradient_clip_val=1.0,
-        accumulate_grad_batches=4,
+        accumulate_grad_batches=max(1, int(args.accumulate_grad_batches)),
         check_val_every_n_epoch=1,
         val_check_interval=vci,
         limit_val_batches=float(args.limit_val_batches),
+        num_sanity_val_steps=max(0, int(args.num_sanity_val_steps)),
         enable_checkpointing=True,
+        enable_model_summary=False,
     )
 
     # IMPORTANT: do NOT pass ckpt_path here (we already loaded weights-only)
@@ -813,6 +865,7 @@ def main():
         "num_obj": int(num_obj),
         "num_attr": int(num_attr),
         "stage2B_provenance": pl_model.stage2B_provenance,
+        "node_encoder_config": pl_model.model.node_encoder_config,
         "best_ckpt": ckpt_cb.best_model_path or "",
         "export_path": str(export_path),
     }

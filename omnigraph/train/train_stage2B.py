@@ -297,6 +297,13 @@ class Stage2BProjectorPL(pl.LightningModule):
         stage2A_ckpt: str,
         lr: float,
         max_length: int,
+        max_graph_tokens: int | None = None,
+        llm_dtype: str = "bfloat16",
+        llm_attn_implementation: str = "sdpa",
+        node_encoder_type: str = "hybrid",
+        node_encoder_out_dim: int = 128,
+        train_node_encoder: bool = True,
+        node_encoder_alpha_init: float = 0.3,
         auto_resize_token_embeddings: bool = True,
     ):
         super().__init__()
@@ -308,14 +315,30 @@ class Stage2BProjectorPL(pl.LightningModule):
             enable_vision=False,
             num_obj=int(num_obj),
             num_attr=int(num_attr),
+            max_graph_tokens=max_graph_tokens,
+            llm_dtype=llm_dtype,
+            llm_attn_implementation=llm_attn_implementation,
+            node_encoder_type=node_encoder_type,
+            node_encoder_out_dim=int(node_encoder_out_dim),
+            node_encoder_trainable=bool(train_node_encoder),
+            node_encoder_alpha_init=float(node_encoder_alpha_init),
         )
 
         # trainable params (Stage2-B)
+        self.train_node_encoder = bool(train_node_encoder)
         for name, p in self.model.named_parameters():
-            if ("vg_adapter" in name) or ("gl_projector" in name) or ("graph_qformer" in name):
+            if (
+                (self.train_node_encoder and (name.startswith("node_encoder.") or ("vg_adapter" in name)))
+                or ("gl_projector" in name)
+                or ("graph_qformer" in name)
+            ):
                 p.requires_grad = True
             else:
                 p.requires_grad = False
+        print(
+            f"[Stage2B] node_encoder_type={self.model.node_encoder_type} "
+            f"train_node_encoder={self.train_node_encoder}"
+        )
 
         # LLM config
         if hasattr(self.model.llm.model, "gradient_checkpointing_enable"):
@@ -476,6 +499,13 @@ def _parse_val_check_interval(x: float) -> float | int:
     return x
 
 
+def _parse_precision(v: str) -> int | str:
+    s = str(v).strip()
+    if s.lstrip("-").isdigit():
+        return int(s)
+    return s
+
+
 # ---------------------------------------------------------------------------
 # Entry
 # ---------------------------------------------------------------------------
@@ -492,8 +522,15 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--max_steps", type=int, default=20000)
     ap.add_argument("--max_length", type=int, default=256)
+    ap.add_argument("--max_graph_tokens", type=int, default=0, help="If >0, truncate graph prefix tokens before LLM.")
     ap.add_argument("--num_workers", type=int, default=4)
-    ap.add_argument("--precision", type=int, default=32)
+    ap.add_argument("--precision", type=str, default="32")
+    ap.add_argument("--llm_dtype", type=str, default="bfloat16", help="LLM load dtype: bfloat16/float16/float32.")
+    ap.add_argument("--llm_attn_implementation", type=str, default="sdpa", help="LLM attention backend (e.g., sdpa/flash_attention_2).")
+    ap.add_argument("--node_encoder_type", type=str, default="hybrid", choices=["hybrid", "open_vocab", "legacy_vg"])
+    ap.add_argument("--node_encoder_out_dim", type=int, default=128, help="Graph node encoder output dim.")
+    ap.add_argument("--train_node_encoder", type=int, default=1, choices=[0, 1], help="1=train node encoder, 0=freeze.")
+    ap.add_argument("--node_encoder_alpha_init", type=float, default=0.3, help="Hybrid node encoder alpha init.")
 
     ap.add_argument("--save_dir", type=str, default="checkpoints_stage2B")
     ap.add_argument("--min_freq", type=int, default=2)
@@ -503,6 +540,11 @@ def main():
     ap.add_argument("--graph_qa_max_per_image", type=int, default=3, help="Max synthetic QA pairs per image.")
     ap.add_argument("--graph_qa_repeat", type=int, default=2, help="Repeat factor for synthetic graph QA samples.")
     ap.add_argument("--graph_qa_seed", type=int, default=42, help="Random seed for synthetic graph QA generation.")
+    ap.add_argument(
+        "--freeze_vg_adapter",
+        action="store_true",
+        help="Deprecated compatibility flag. If set, node encoder is frozen in Stage2B.",
+    )
 
     ap.add_argument("--val_ratio", type=float, default=0.001)
     ap.add_argument("--patience", type=int, default=2)
@@ -511,6 +553,8 @@ def main():
     ap.add_argument("--val_check_interval", type=float, default=2000,
                     help=">=1: validate every N steps; (0,1]: fraction epoch")
     ap.add_argument("--limit_val_batches", type=float, default=1.0)
+    ap.add_argument("--num_sanity_val_steps", type=int, default=0)
+    ap.add_argument("--accumulate_grad_batches", type=int, default=4)
     args = ap.parse_args()
 
     pl.seed_everything(args.seed, workers=True)
@@ -590,6 +634,8 @@ def main():
     )
     vci = _parse_val_check_interval(args.val_check_interval)
 
+    train_node_encoder = bool(int(args.train_node_encoder)) and (not bool(args.freeze_vg_adapter))
+
     # 4) stage2-B model
     pl_model = Stage2BProjectorPL(
         llm_model_name=args.llm,
@@ -599,6 +645,13 @@ def main():
         stage2A_ckpt=str(args.stage2A_ckpt),
         lr=args.lr,
         max_length=args.max_length,
+        max_graph_tokens=(int(args.max_graph_tokens) if int(args.max_graph_tokens) > 0 else None),
+        llm_dtype=str(args.llm_dtype),
+        llm_attn_implementation=str(args.llm_attn_implementation),
+        node_encoder_type=str(args.node_encoder_type),
+        node_encoder_out_dim=int(args.node_encoder_out_dim),
+        train_node_encoder=bool(train_node_encoder),
+        node_encoder_alpha_init=float(args.node_encoder_alpha_init),
         auto_resize_token_embeddings=True,
     )
 
@@ -633,16 +686,18 @@ def main():
     trainer = pl.Trainer(
         accelerator="gpu" if use_gpu else "cpu",
         devices=devices,
-        precision=args.precision,
+        precision=_parse_precision(args.precision),
         max_steps=args.max_steps,
         max_epochs=999999,  # max_steps 控制
         callbacks=[ckpt, lr_monitor, early],
         log_every_n_steps=10,
         gradient_clip_val=1.0,
-        accumulate_grad_batches=4,
+        accumulate_grad_batches=max(1, int(args.accumulate_grad_batches)),
         check_val_every_n_epoch=1,
         val_check_interval=vci,
         limit_val_batches=float(args.limit_val_batches),
+        num_sanity_val_steps=max(0, int(args.num_sanity_val_steps)),
+        enable_model_summary=False,
     )
 
     trainer.fit(pl_model, train_dataloaders=train_loader, val_dataloaders=val_loader)
@@ -655,6 +710,7 @@ def main():
         "num_obj": int(num_obj),
         "num_attr": int(num_attr),
         "stage2A_provenance": stage2a_provenance,
+        "node_encoder_config": pl_model.model.node_encoder_config,
         "best_ckpt": ckpt.best_model_path or "",
         "export_path": str(out_pt),
     }

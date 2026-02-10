@@ -62,6 +62,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Evaluate GQA accuracy.")
     ap.add_argument("--gt", required=True, help="GT jsonl (fields: id, answer, types)")
     ap.add_argument("--pred", required=True, help="Pred jsonl (fields: id, pred)")
+    ap.add_argument("--query_target", type=float, default=-1.0, help="Optional query strict target gate.")
+    ap.add_argument("--query_sprint_target", type=float, default=-1.0, help="Optional query strict sprint target gate.")
     args = ap.parse_args()
 
     gt = load_jsonl(Path(args.gt))
@@ -147,6 +149,21 @@ def main() -> int:
         for k in sorted(by_struct_canonical.keys()):
             c, t = by_struct_canonical[k]
             print(f"  {k}: {c/t:.4f} ({c}/{t})")
+
+    if "query" in by_struct_strict:
+        qc, qt = by_struct_strict["query"]
+        qacc = qc / qt if qt > 0 else 0.0
+        print(f"Query accuracy (strict): {qacc:.4f} ({qc}/{qt})")
+        if float(args.query_target) >= 0:
+            print(
+                f"Query target gate ({float(args.query_target):.4f}): "
+                f"{'PASS' if qacc >= float(args.query_target) else 'FAIL'}"
+            )
+        if float(args.query_sprint_target) >= 0:
+            print(
+                f"Query sprint gate ({float(args.query_sprint_target):.4f}): "
+                f"{'PASS' if qacc >= float(args.query_sprint_target) else 'FAIL'}"
+            )
     return 0
 
 

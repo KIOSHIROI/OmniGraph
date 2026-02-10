@@ -87,6 +87,17 @@ def build_prompt_for_tokenizer(tokenizer: Any, prompt: str) -> str:
     return prompt
 
 
+def _load_stage3_meta(ckpt_path: str) -> Dict[str, Any]:
+    ckpt = Path(ckpt_path)
+    meta_path = ckpt.parent / "stage3_meta.json"
+    if not meta_path.exists():
+        return {}
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 class GQATriModalDataset(Dataset):
     def __init__(
         self,
@@ -193,6 +204,9 @@ def main() -> int:
     ap.add_argument("--llm", default="Qwen/Qwen2.5-7B-Instruct")
     ap.add_argument("--vision", default="Salesforce/blip2-flan-t5-xl")
     ap.add_argument("--graph_model", default="clip_gt_arxiv_pub")
+    ap.add_argument("--node_encoder_type", default="auto", choices=["auto", "hybrid", "open_vocab", "legacy_vg"])
+    ap.add_argument("--node_encoder_alpha_init", type=float, default=-1.0, help="<0 means read from stage3_meta or fallback.")
+    ap.add_argument("--node_encoder_out_dim", type=int, default=0, help="<=0 means read from stage3_meta or fallback 128.")
     ap.add_argument("--batch_size", type=int, default=1)
     ap.add_argument("--max_length", type=int, default=128)
     ap.add_argument("--max_new_tokens", type=int, default=12)
@@ -208,6 +222,29 @@ def main() -> int:
     print("[Pipeline] GQA inference start (short-answer constrained decoding).")
     use_vision = not bool(args.disable_vision)
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() and int(args.gpu) >= 0 else "cpu")
+
+    stage3_meta = _load_stage3_meta(args.ckpt)
+    stage3_node_cfg = stage3_meta.get("node_encoder_config", {}) if isinstance(stage3_meta, dict) else {}
+    resolved_node_encoder_type = (
+        str(stage3_node_cfg.get("type", "hybrid"))
+        if str(args.node_encoder_type).strip().lower() == "auto"
+        else str(args.node_encoder_type).strip().lower()
+    )
+    resolved_node_encoder_alpha = (
+        float(stage3_node_cfg.get("alpha_init", 0.3))
+        if float(args.node_encoder_alpha_init) < 0
+        else float(args.node_encoder_alpha_init)
+    )
+    resolved_node_encoder_out_dim = (
+        int(stage3_node_cfg.get("out_dim", 128))
+        if int(args.node_encoder_out_dim) <= 0
+        else int(args.node_encoder_out_dim)
+    )
+    print(
+        "[Config] "
+        f"llm={args.llm} vision={args.vision} node_encoder={resolved_node_encoder_type} "
+        f"alpha_init={resolved_node_encoder_alpha} out_dim={resolved_node_encoder_out_dim}"
+    )
 
     obj_vocab, pred_vocab, attr_vocab = build_vg_vocabs_from_file(args.scene_graphs, min_freq=int(args.min_freq))
     num_obj = len(obj_vocab.stoi)
@@ -261,6 +298,10 @@ def main() -> int:
         enable_vision=use_vision,
         num_obj=int(num_obj),
         num_attr=int(num_attr),
+        node_encoder_type=resolved_node_encoder_type,
+        node_encoder_alpha_init=resolved_node_encoder_alpha,
+        node_encoder_out_dim=resolved_node_encoder_out_dim,
+        node_encoder_trainable=False,
     )
     sd = torch.load(args.ckpt, map_location="cpu")
     model_sd = model.state_dict()
@@ -312,7 +353,8 @@ def main() -> int:
             # ensure graph_node for GraphCLIP-GT
             if hasattr(graph_data, "obj_id") and hasattr(graph_data, "attr_id") and hasattr(graph_data, "bbox"):
                 try:
-                    graph_node = model.vg_adapter(
+                    node_encoder = getattr(model, "node_encoder", None) or getattr(model, "vg_adapter", None)
+                    graph_node = node_encoder(
                         graph_data.obj_id,
                         graph_data.attr_id,
                         graph_data.bbox,

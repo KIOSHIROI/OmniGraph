@@ -3,8 +3,7 @@ from omnigraph.utils.env import setup_env
 setup_env()
 import torch
 import torch.nn as nn
-from omnigraph.model.graph.VGNodeAdapter import VGNodeAdapter
-from omnigraph.model.graph.graph_transformer import graph_transformer
+from omnigraph.model.graph.node_encoder import build_graph_node_encoder
 from omnigraph.model.graph.builder import build_graph_tower
 from omnigraph.model.graph.graph_branch import GraphBranch
 from omnigraph.model.graph.graph_qformer import GraphQFormer, GraphQFormerConfig
@@ -26,6 +25,14 @@ class OmniGraphModel(nn.Module):
                  enable_vision: bool = True,
                  num_obj: int | None = None,
                  num_attr: int | None = None,
+                 max_graph_tokens: int | None = None,
+                 max_vision_tokens: int | None = None,
+                 llm_dtype: str = "bfloat16",
+                 llm_attn_implementation: str = "sdpa",
+                 node_encoder_type: str = "hybrid",
+                 node_encoder_out_dim: int = 128,
+                 node_encoder_trainable: bool = True,
+                 node_encoder_alpha_init: float = 0.3,
                  ):
         super().__init__()
         if num_obj is None or num_attr is None:
@@ -35,10 +42,40 @@ class OmniGraphModel(nn.Module):
 
         self.num_obj = int(num_obj)
         self.num_attr = int(num_attr)
-        self.vg_adapter = VGNodeAdapter(num_obj=self.num_obj, num_attr=self.num_attr, out_dim=128)
+        self.max_graph_tokens = int(max_graph_tokens) if max_graph_tokens is not None and int(max_graph_tokens) > 0 else None
+        self.max_vision_tokens = int(max_vision_tokens) if max_vision_tokens is not None and int(max_vision_tokens) > 0 else None
+        self.node_encoder_type = str(node_encoder_type).strip().lower() or "hybrid"
+        self.node_encoder_trainable = bool(node_encoder_trainable)
+        self.node_encoder_alpha_init = float(node_encoder_alpha_init)
+        self.node_encoder = build_graph_node_encoder(
+            node_encoder_type=self.node_encoder_type,
+            num_obj=self.num_obj,
+            num_attr=self.num_attr,
+            out_dim=int(node_encoder_out_dim),
+            alpha_init=self.node_encoder_alpha_init,
+            alpha_trainable=self.node_encoder_trainable,
+        )
+        for p in self.node_encoder.parameters():
+            p.requires_grad = self.node_encoder_trainable
+        print(
+            "[NodeEncoder] "
+            f"type={self.node_encoder_type} out_dim={self.node_encoder.out_dim} "
+            f"trainable={self.node_encoder_trainable} alpha_init={self.node_encoder_alpha_init}"
+        )
+        self.node_encoder_config = {
+            "type": self.node_encoder_type,
+            "out_dim": int(self.node_encoder.out_dim),
+            "trainable": bool(self.node_encoder_trainable),
+            "alpha_init": float(self.node_encoder_alpha_init),
+        }
         # 1. LLM (Frozen, bf16)
         print(f"Loading LLM: {llm_model_name}...")
-        self.llm = LlamaLLM(model_name=llm_model_name, pretrained_model=pretrained_llm)
+        self.llm = LlamaLLM(
+            model_name=llm_model_name,
+            pretrained_model=pretrained_llm,
+            dtype=llm_dtype,
+            attn_implementation=llm_attn_implementation,
+        )
         self.hidden_size = self.llm.config.hidden_size
         
         # 2. Graph Branch
@@ -57,7 +94,7 @@ class OmniGraphModel(nn.Module):
         if pretrained_graph_qformer is not None:
              self.graph_qformer = pretrained_graph_qformer
         else:
-             graph_qformer_config = GraphQFormerConfig(graph_hidden_dim=128)
+             graph_qformer_config = GraphQFormerConfig(graph_hidden_dim=int(self.node_encoder.out_dim))
              self.graph_qformer = GraphQFormer(config=graph_qformer_config)
         # Ensure Q-Former is trainable (it should be by default)
         for p in self.graph_qformer.parameters():
@@ -122,13 +159,26 @@ class OmniGraphModel(nn.Module):
             self.vision_branch = None
             self.vl_projector = None
 
+    @staticmethod
+    def _truncate_prefix_tokens(tokens: torch.Tensor | None, max_tokens: int | None) -> torch.Tensor | None:
+        if tokens is None or max_tokens is None:
+            return tokens
+        if tokens.size(1) <= max_tokens:
+            return tokens
+        return tokens[:, :max_tokens, :]
+
+    @property
+    def vg_adapter(self):
+        # Backward-compatible view for legacy call-sites.
+        return self.node_encoder
+
     def _inject_graph_node_features(self, graph_data):
         if graph_data is None:
             return None
         if not (hasattr(graph_data, "obj_id") and hasattr(graph_data, "attr_id") and hasattr(graph_data, "bbox")):
             return graph_data
 
-        x = self.vg_adapter(
+        x = self.node_encoder(
             graph_data.obj_id,
             graph_data.attr_id,
             graph_data.bbox,
@@ -174,9 +224,11 @@ class OmniGraphModel(nn.Module):
             else:
                 graph_tokens = self.graph_branch(graph_data)     # (B, Nq, d_qformer)
             graph_embeds = self.gl_projector(graph_tokens)      # (B, Nq, 4096)
+            graph_embeds = self._truncate_prefix_tokens(graph_embeds, self.max_graph_tokens)
             if return_debug:
                 debug["graph_embeds_nan"] = bool(torch.isnan(graph_embeds).any().item())
                 debug["graph_embeds_inf"] = bool(torch.isinf(graph_embeds).any().item())
+                debug["graph_prefix_tokens"] = int(graph_embeds.shape[1])
             if graph_embeds.dtype != target_dtype:
                 graph_embeds = graph_embeds.to(target_dtype)
             embeds_list.append(graph_embeds)
@@ -189,11 +241,13 @@ class OmniGraphModel(nn.Module):
             vision_tokens = self.vision_branch(pixel_values)
             # vision_embeds: (B, Nq_vision, 4096)
             vision_embeds = self.vl_projector(vision_tokens)
+            vision_embeds = self._truncate_prefix_tokens(vision_embeds, self.max_vision_tokens)
             if return_debug:
                 debug["vision_tokens_nan"] = bool(torch.isnan(vision_tokens).any().item())
                 debug["vision_tokens_inf"] = bool(torch.isinf(vision_tokens).any().item())
                 debug["vision_embeds_nan"] = bool(torch.isnan(vision_embeds).any().item())
                 debug["vision_embeds_inf"] = bool(torch.isinf(vision_embeds).any().item())
+                debug["vision_prefix_tokens"] = int(vision_embeds.shape[1])
             if vision_embeds.dtype != target_dtype:
                 vision_embeds = vision_embeds.to(target_dtype)
             embeds_list.append(vision_embeds)
@@ -249,6 +303,7 @@ class OmniGraphModel(nn.Module):
             graph_data = self._inject_graph_node_features(graph_data)
             graph_tokens = self.graph_branch(graph_data)
             graph_embeds = self.gl_projector(graph_tokens)
+            graph_embeds = self._truncate_prefix_tokens(graph_embeds, self.max_graph_tokens)
             if graph_embeds.dtype != target_dtype:
                 graph_embeds = graph_embeds.to(target_dtype)
             embeds_list.append(graph_embeds)
@@ -256,6 +311,7 @@ class OmniGraphModel(nn.Module):
         if pixel_values is not None and self.vision_branch is not None and self.vl_projector is not None:
             vision_tokens = self.vision_branch(pixel_values)
             vision_embeds = self.vl_projector(vision_tokens)
+            vision_embeds = self._truncate_prefix_tokens(vision_embeds, self.max_vision_tokens)
             if vision_embeds.dtype != target_dtype:
                 vision_embeds = vision_embeds.to(target_dtype)
             embeds_list.append(vision_embeds)

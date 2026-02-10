@@ -1,69 +1,59 @@
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 
 from omnigraph.model.graph.node_encoder import GraphNodeEncoderBase
 
 
-class LegacyVGNodeEncoder(GraphNodeEncoderBase):
+class OpenVocabNodeEncoder(GraphNodeEncoderBase):
     """
-    Generalization-oriented adapter for VG nodes.
-    - Keeps vocab embeddings for in-domain fidelity.
-    - Adds hash embeddings for OOV robustness.
-    - Uses masked attribute pooling (ignores pad attrs).
-    - Injects relation predicates via edge aggregation.
+    Open-vocab graph node encoder.
+    Uses hash + geometry + relation aggregation; no closed-vocab object/attribute embedding.
     """
 
     def __init__(
         self,
-        num_obj: int,
-        num_attr: int,
         out_dim: int = 128,
-        obj_dim: int = 80,
-        attr_dim: int = 56,
-        hash_dim: int = 32,
-        bbox_dim: int = 48,
+        hash_dim: int = 64,
+        bbox_dim: int = 64,
         hash_buckets: int = 65536,
         attr_pad_id: int = 0,
-    ):
+    ) -> None:
         super().__init__(out_dim=int(out_dim))
         self.attr_pad_id = int(attr_pad_id)
 
-        self.obj_emb = nn.Embedding(num_obj, obj_dim)
-        self.attr_emb = nn.Embedding(num_attr, attr_dim)
-
-        # Hash channels reduce hard dependency on closed VG vocab ids.
-        self.obj_hash_emb = nn.Embedding(hash_buckets, hash_dim)
-        self.attr_hash_emb = nn.Embedding(hash_buckets, hash_dim)
-        self.rel_hash_emb = nn.Embedding(hash_buckets, hash_dim)
+        self.obj_hash_emb = nn.Embedding(int(hash_buckets), int(hash_dim))
+        self.attr_hash_emb = nn.Embedding(int(hash_buckets), int(hash_dim))
+        self.rel_hash_emb = nn.Embedding(int(hash_buckets), int(hash_dim))
 
         self.bbox_mlp = nn.Sequential(
-            nn.Linear(8, bbox_dim),
+            nn.Linear(8, int(bbox_dim)),
             nn.GELU(),
-            nn.Linear(bbox_dim, bbox_dim),
+            nn.Linear(int(bbox_dim), int(bbox_dim)),
             nn.GELU(),
         )
 
-        base_in = obj_dim + attr_dim + hash_dim + hash_dim + bbox_dim
+        base_in = int(hash_dim) + int(hash_dim) + int(bbox_dim)
         self.proj = nn.Sequential(
-            nn.Linear(base_in, out_dim),
+            nn.Linear(base_in, self.out_dim),
             nn.GELU(),
-            nn.Linear(out_dim, out_dim),
+            nn.Linear(self.out_dim, self.out_dim),
         )
         self.rel_proj = nn.Sequential(
-            nn.Linear(hash_dim, out_dim),
+            nn.Linear(int(hash_dim), self.out_dim),
             nn.GELU(),
-            nn.Linear(out_dim, out_dim),
+            nn.Linear(self.out_dim, self.out_dim),
         )
-        self.out_norm = nn.LayerNorm(out_dim)
+        self.out_norm = nn.LayerNorm(self.out_dim)
 
     def _masked_attr_mean(self, attr_embed: torch.Tensor, attr_id: torch.Tensor) -> torch.Tensor:
-        # attr_embed: [N, A, D], attr_id: [N, A]
         mask = (attr_id != self.attr_pad_id).unsqueeze(-1).to(attr_embed.dtype)
         denom = mask.sum(dim=1).clamp_min(1.0)
         return (attr_embed * mask).sum(dim=1) / denom
 
-    def _bbox_features(self, bbox: torch.Tensor) -> torch.Tensor:
-        # bbox: [N,4] normalized [x,y,w,h]
+    @staticmethod
+    def _bbox_features(bbox: torch.Tensor) -> torch.Tensor:
         x = bbox[:, 0:1]
         y = bbox[:, 1:2]
         w = bbox[:, 2:3]
@@ -93,8 +83,7 @@ class LegacyVGNodeEncoder(GraphNodeEncoderBase):
         else:
             return torch.zeros_like(node_feat)
 
-        rel_n = self.rel_proj(rel_e)  # [E, out_dim]
-        src = edge_index[0].long()
+        rel_n = self.rel_proj(rel_e)
         dst = edge_index[1].long()
         n = node_feat.size(0)
 
@@ -102,8 +91,7 @@ class LegacyVGNodeEncoder(GraphNodeEncoderBase):
         deg = torch.zeros(n, 1, device=node_feat.device, dtype=node_feat.dtype)
         out.index_add_(0, dst, rel_n)
         deg.index_add_(0, dst, torch.ones(dst.size(0), 1, device=deg.device, dtype=deg.dtype))
-        out = out / deg.clamp_min(1.0)
-        return out
+        return out / deg.clamp_min(1.0)
 
     def forward(
         self,
@@ -116,10 +104,6 @@ class LegacyVGNodeEncoder(GraphNodeEncoderBase):
         edge_pred_id: torch.Tensor | None = None,
         edge_pred_hash_id: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # obj_id: [N], attr_id: [N,A], bbox:[N,4]
-        o_vocab = self.obj_emb(obj_id)  # [N, Do]
-        a_vocab = self._masked_attr_mean(self.attr_emb(attr_id), attr_id)  # [N, Da]
-
         if obj_hash_id is None:
             obj_hash_id = obj_id
         if attr_hash_id is None:
@@ -127,16 +111,11 @@ class LegacyVGNodeEncoder(GraphNodeEncoderBase):
 
         obj_hash_idx = obj_hash_id.long().remainder(self.obj_hash_emb.num_embeddings)
         attr_hash_idx = attr_hash_id.long().remainder(self.attr_hash_emb.num_embeddings)
-        o_hash = self.obj_hash_emb(obj_hash_idx)  # [N, Dh]
-        a_hash = self._masked_attr_mean(self.attr_hash_emb(attr_hash_idx), attr_id)  # [N, Dh]
 
-        b = self.bbox_mlp(self._bbox_features(bbox))  # [N, Db]
-        base = self.proj(torch.cat([o_vocab, a_vocab, o_hash, a_hash, b], dim=-1))  # [N, D]
+        o_hash = self.obj_hash_emb(obj_hash_idx)
+        a_hash = self._masked_attr_mean(self.attr_hash_emb(attr_hash_idx), attr_id)
+        b = self.bbox_mlp(self._bbox_features(bbox))
+
+        base = self.proj(torch.cat([o_hash, a_hash, b], dim=-1))
         rel = self._aggregate_rel(base, edge_index=edge_index, edge_pred_id=edge_pred_id, edge_pred_hash_id=edge_pred_hash_id)
         return self.out_norm(base + rel)
-
-
-class VGNodeAdapter(LegacyVGNodeEncoder):
-    """Backward-compatible alias."""
-
-    pass
