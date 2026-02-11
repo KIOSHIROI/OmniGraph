@@ -36,7 +36,7 @@ $PYTHON_BIN "$REPO/scripts/eval/infer_gqa.py" \
   --image_root "$IMAGE_ROOT" \
   --ckpt "$CKPT" \
   --output "$PRED" \
-  --batch_size 1 \
+  --batch_size 10 \
   --max_length 128 \
   --max_new_tokens 12 \
   --gpu "$GPU" \

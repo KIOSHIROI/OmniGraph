@@ -1,0 +1,23 @@
+{
+  "stage": "stage2A",
+  "stage1_qformer_ckpt": "/media/disk/02drive/13hias/04bxy/OmniGraph/graph_qformer_stage1.pt",
+  "num_obj": 37858,
+  "num_attr": 28319,
+  "stage1_load_info": {
+    "stage1_qformer_ckpt": "/media/disk/02drive/13hias/04bxy/OmniGraph/graph_qformer_stage1.pt",
+    "loaded_keys": 324,
+    "total_model_keys": 324,
+    "missing_keys": 0,
+    "unexpected_keys": 0,
+    "adapted_keys": 1,
+    "skipped_shape_mismatch_keys": 0
+  },
+  "node_encoder_config": {
+    "type": "hybrid",
+    "out_dim": 128,
+    "trainable": true,
+    "alpha_init": 0.3
+  },
+  "best_ckpt": "/media/disk/02drive/13hias/04bxy/OmniGraph/checkpoints_projector_vg/stage2A_paper/stage2A-step=step=0027000-val_loss=val_loss=2.544.ckpt",
+  "export_path": "/media/disk/02drive/13hias/04bxy/OmniGraph/checkpoints_projector_vg/stage2A_paper/model_state_dict.pt"
+}
