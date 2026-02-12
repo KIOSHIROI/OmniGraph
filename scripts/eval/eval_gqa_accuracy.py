@@ -89,6 +89,8 @@ def main() -> int:
         pred_map[key] = {
             "pred": normalize(raw),
             "pred_canonical": canonicalize(raw),
+            "has_graph": bool(x.get("has_graph", True)),
+            "has_image": bool(x.get("has_image", True)),
         }
 
     gt_ids: Set[str] = set(gt_map.keys())
@@ -101,6 +103,9 @@ def main() -> int:
     answered = len(answered_ids)
     correct_all_strict = 0
     correct_all_canonical = 0
+    correct_complete_strict = 0
+    correct_complete_canonical = 0
+    complete_total = 0
     by_struct_strict = {}
     by_struct_canonical = {}
 
@@ -110,6 +115,11 @@ def main() -> int:
         hit_canonical = int(pred_ans is not None and pred_ans["pred_canonical"] == gt_item["answer_canonical"])
         correct_all_strict += hit_strict
         correct_all_canonical += hit_canonical
+
+        if pred_ans is not None and bool(pred_ans.get("has_graph", True)) and bool(pred_ans.get("has_image", True)):
+            complete_total += 1
+            correct_complete_strict += hit_strict
+            correct_complete_canonical += hit_canonical
 
         st = str(gt_item.get("types", {}).get("structural", ""))
         if st:
@@ -129,6 +139,11 @@ def main() -> int:
     print(f"Accuracy (strict, answered only): {acc_answered:.4f} ({correct_all_strict}/{answered})")
     print(f"Accuracy (canonical, all GT): {acc_all_canonical:.4f} ({correct_all_canonical}/{total_gt})")
     print(f"Accuracy (canonical, answered only): {acc_answered_canonical:.4f} ({correct_all_canonical}/{answered})")
+    if complete_total > 0:
+        acc_complete_strict = correct_complete_strict / complete_total
+        acc_complete_canonical = correct_complete_canonical / complete_total
+        print(f"Accuracy (strict, complete modalities only): {acc_complete_strict:.4f} ({correct_complete_strict}/{complete_total})")
+        print(f"Accuracy (canonical, complete modalities only): {acc_complete_canonical:.4f} ({correct_complete_canonical}/{complete_total})")
     print(f"Missing predictions: {len(missing_ids)}")
     print(f"Extra predictions (id not in GT): {len(extra_ids)}")
 

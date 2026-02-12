@@ -5,6 +5,7 @@ import argparse
 import json
 import re
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -18,7 +19,7 @@ from omnigraph.utils.env import setup_env  # noqa: E402
 setup_env()
 
 import torch
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset, IterableDataset, Subset
 from transformers import AutoProcessor, AutoTokenizer
 
 from omnigraph.data.vg_scene_graph_dataset import VGSceneGraphDataset, build_vg_vocabs_from_file
@@ -34,6 +35,18 @@ def load_jsonl(path: Path) -> List[Dict[str, Any]]:
                 continue
             items.append(json.loads(line))
     return items
+
+
+def iter_jsonl(path: Path):
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except Exception:
+                continue
 
 
 def find_image_path(image_root: Path, image_id: str) -> Optional[str]:
@@ -105,10 +118,12 @@ class GQATriModalDataset(Dataset):
         questions: List[Dict[str, Any]],
         image_root: str,
         use_vision: bool = True,
+        allow_missing_modalities: bool = False,
     ):
         self.sg = sg_dataset
         self.image_root = Path(image_root)
         self.use_vision = bool(use_vision)
+        self.allow_missing_modalities = bool(allow_missing_modalities)
 
         raw_items = getattr(self.sg, "items", None)
         if raw_items is None:
@@ -127,23 +142,30 @@ class GQATriModalDataset(Dataset):
             question = str(rec.get("question", "")).strip()
             if not qid or not image_id or not question:
                 continue
-            if image_id not in self.image2idx:
-                continue
+            has_graph = image_id in self.image2idx
 
             image_path = str(rec.get("image_path", "")).strip() or None
+            has_image = False
             if self.use_vision:
                 if image_path is None or not Path(image_path).exists():
                     image_path = find_image_path(self.image_root, image_id)
-                if image_path is None:
+                has_image = image_path is not None
+
+            if not self.allow_missing_modalities:
+                if not has_graph:
+                    continue
+                if self.use_vision and not has_image:
                     continue
 
             self.samples.append(
                 {
                     "id": qid,
                     "image_id": image_id,
-                    "sg_idx": int(self.image2idx[image_id]),
+                    "sg_idx": int(self.image2idx[image_id]) if has_graph else None,
                     "question": question,
-                    "image_path": image_path,
+                    "image_path": image_path if has_image else None,
+                    "has_graph": bool(has_graph),
+                    "has_image": bool(has_image) if self.use_vision else False,
                 }
             )
 
@@ -152,14 +174,16 @@ class GQATriModalDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         s = self.samples[idx]
-        sg_item = self.sg[int(s["sg_idx"])]
+        sg_item = self.sg[int(s["sg_idx"])] if s.get("sg_idx") is not None else None
         out = {
             "id": str(s["id"]),
             "image_id": str(s["image_id"]),
-            "graph_data": sg_item["graph_data"],
+            "graph_data": sg_item["graph_data"] if sg_item is not None else None,
             "prompt": build_short_answer_prompt(str(s["question"])),
+            "has_graph": bool(s.get("has_graph", False)),
+            "has_image": bool(s.get("has_image", False)),
         }
-        if self.use_vision:
+        if self.use_vision and s.get("image_path"):
             from PIL import Image
 
             img = Image.open(str(s["image_path"])).convert("RGB")
@@ -167,30 +191,95 @@ class GQATriModalDataset(Dataset):
         return out
 
 
+class GQATriModalIterableDataset(IterableDataset):
+    def __init__(
+        self,
+        sg_dataset: VGSceneGraphDataset,
+        questions_path: Path,
+        image_root: str,
+        use_vision: bool = True,
+        allow_missing_modalities: bool = False,
+        max_samples: int = 0,
+    ):
+        super().__init__()
+        self.sg = sg_dataset
+        self.questions_path = Path(questions_path)
+        self.image_root = Path(image_root)
+        self.use_vision = bool(use_vision)
+        self.allow_missing_modalities = bool(allow_missing_modalities)
+        self.max_samples = int(max_samples)
+
+        raw_items = getattr(self.sg, "items", None)
+        if raw_items is None:
+            raise AttributeError("VGSceneGraphDataset must expose .items for image_id join.")
+
+        image2idx: Dict[str, int] = {}
+        for i, it in enumerate(raw_items):
+            if isinstance(it, dict) and "image_id" in it:
+                image2idx[str(it["image_id"])] = i
+        self.image2idx = image2idx
+
+    def __iter__(self):
+        yielded = 0
+        for rec in iter_jsonl(self.questions_path):
+            qid = str(rec.get("id", "")).strip()
+            image_id = str(rec.get("image_id", "")).strip()
+            question = str(rec.get("question", "")).strip()
+            if not qid or not image_id or not question:
+                continue
+
+            has_graph = image_id in self.image2idx
+            image_path = str(rec.get("image_path", "")).strip() or None
+            has_image = False
+            if self.use_vision:
+                if image_path is None or not Path(image_path).exists():
+                    image_path = find_image_path(self.image_root, image_id)
+                has_image = image_path is not None
+
+            if not self.allow_missing_modalities:
+                if not has_graph:
+                    continue
+                if self.use_vision and not has_image:
+                    continue
+
+            sg_item = self.sg[int(self.image2idx[image_id])] if has_graph else None
+            out = {
+                "id": qid,
+                "image_id": image_id,
+                "graph_data": sg_item["graph_data"] if sg_item is not None else None,
+                "prompt": build_short_answer_prompt(question),
+                "has_graph": bool(has_graph),
+                "has_image": bool(has_image) if self.use_vision else False,
+            }
+            if self.use_vision and image_path:
+                from PIL import Image
+
+                img = Image.open(str(image_path)).convert("RGB")
+                out["pil_image"] = img
+            yield out
+            yielded += 1
+            if self.max_samples > 0 and yielded >= self.max_samples:
+                break
+
+
 def collate_gqa(batch: List[Dict[str, Any]], processor: Any, use_vision: bool) -> Dict[str, Any]:
-    from torch_geometric.data import Batch as GeoBatch
-
-    graphs = [x["graph_data"] for x in batch]
-    batch_graph = GeoBatch.from_data_list(graphs)
-
     ids = [x["id"] for x in batch]
     image_ids = [x["image_id"] for x in batch]
     prompts = [x["prompt"] for x in batch]
+    has_graph = [bool(x.get("has_graph", False)) for x in batch]
+    has_image = [bool(x.get("has_image", False)) for x in batch]
+    graph_list = [x.get("graph_data", None) for x in batch]
+    pil_images = [x.get("pil_image", None) for x in batch]
 
     out = {
         "ids": ids,
         "image_ids": image_ids,
         "prompts": prompts,
-        "graph_data": batch_graph,
-        "pixel_values": None,
+        "graph_list": graph_list,
+        "pil_images": pil_images,
+        "has_graph": has_graph,
+        "has_image": has_image,
     }
-
-    if use_vision:
-        pixel_values = []
-        for x in batch:
-            pv = processor(images=x["pil_image"], return_tensors="pt")["pixel_values"][0]
-            pixel_values.append(pv)
-        out["pixel_values"] = torch.stack(pixel_values, dim=0)
     return out
 
 
@@ -215,8 +304,13 @@ def main() -> int:
     ap.add_argument("--max_nodes", type=int, default=80)
     ap.add_argument("--max_attrs", type=int, default=6)
     ap.add_argument("--disable_vision", action="store_true", help="disable vision branch at inference")
+    ap.add_argument("--allow_missing_modalities", action="store_true", help="allow missing graph/image inputs")
+    ap.add_argument("--stream_questions", action="store_true", help="stream questions jsonl to reduce RAM")
     ap.add_argument("--max_samples", type=int, default=0, help="limit number of samples for quick eval")
     ap.add_argument("--log_every", type=int, default=200, help="log progress every N samples")
+    ap.add_argument("--num_workers", type=int, default=4)
+    ap.add_argument("--prefetch_factor", type=int, default=4)
+    ap.add_argument("--persistent_workers", action="store_true")
     args = ap.parse_args()
 
     print("[Pipeline] GQA inference start (short-answer constrained decoding).")
@@ -261,18 +355,30 @@ def main() -> int:
         add_reverse_edges=True,
         use_bbox_max_norm=True,
     )
-    questions = load_jsonl(Path(args.questions))
-    dataset = GQATriModalDataset(
-        sg_dataset=sg_dataset,
-        questions=questions,
-        image_root=args.image_root,
-        use_vision=use_vision,
-    )
-    if int(args.max_samples) > 0:
-        dataset = Subset(dataset, list(range(min(int(args.max_samples), len(dataset)))))
-    print(f"[Join] usable_questions={len(dataset)}")
-    if len(dataset) == 0:
-        raise RuntimeError("No usable GQA samples after joining questions/scene-graphs/images.")
+    if bool(args.stream_questions):
+        dataset = GQATriModalIterableDataset(
+            sg_dataset=sg_dataset,
+            questions_path=Path(args.questions),
+            image_root=args.image_root,
+            use_vision=use_vision,
+            allow_missing_modalities=bool(args.allow_missing_modalities),
+            max_samples=int(args.max_samples),
+        )
+        print("[Join] usable_questions=streaming")
+    else:
+        questions = load_jsonl(Path(args.questions))
+        dataset = GQATriModalDataset(
+            sg_dataset=sg_dataset,
+            questions=questions,
+            image_root=args.image_root,
+            use_vision=use_vision,
+            allow_missing_modalities=bool(args.allow_missing_modalities),
+        )
+        if int(args.max_samples) > 0:
+            dataset = Subset(dataset, list(range(min(int(args.max_samples), len(dataset)))))
+        print(f"[Join] usable_questions={len(dataset)}")
+        if len(dataset) == 0:
+            raise RuntimeError("No usable GQA samples after joining questions/scene-graphs/images.")
 
     processor = AutoProcessor.from_pretrained(args.vision) if use_vision else None
     tokenizer = AutoTokenizer.from_pretrained(args.llm, use_fast=True)
@@ -286,9 +392,11 @@ def main() -> int:
         dataset,
         batch_size=int(args.batch_size),
         shuffle=False,
-        num_workers=2,
+        num_workers=int(args.num_workers),
         pin_memory=True,
         collate_fn=_collate,
+        prefetch_factor=int(args.prefetch_factor) if int(args.num_workers) > 0 else None,
+        persistent_workers=bool(args.persistent_workers) and int(args.num_workers) > 0,
     )
 
     model = OmniGraphModel(
@@ -319,6 +427,20 @@ def main() -> int:
     model.to(device)
     model.eval()
 
+    if device.type == "cuda":
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+        except Exception:
+            pass
+        try:
+            torch.backends.cudnn.benchmark = True
+        except Exception:
+            pass
+
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -337,80 +459,123 @@ def main() -> int:
     if tqdm is not None:
         iterator = tqdm(loader, total=total, desc="Infer GQA")
 
-    with out_path.open("w", encoding="utf-8") as f, torch.no_grad():
+    amp_dtype = torch.bfloat16 if device.type == "cuda" else None
+    autocast_ctx = torch.cuda.amp.autocast if device.type == "cuda" else nullcontext
+
+    with out_path.open("w", encoding="utf-8") as f, torch.inference_mode():
         seen = 0
         for batch in iterator:
-            prompt_texts = [build_prompt_for_tokenizer(tokenizer, p) for p in batch["prompts"]]
-            tok = tokenizer(
-                prompt_texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=int(args.max_length),
-            )
-            input_ids = tok["input_ids"].to(device)
-            graph_data = batch["graph_data"].to(device)
-            # ensure graph_node for GraphCLIP-GT
-            if hasattr(graph_data, "obj_id") and hasattr(graph_data, "attr_id") and hasattr(graph_data, "bbox"):
-                try:
-                    node_encoder = getattr(model, "node_encoder", None) or getattr(model, "vg_adapter", None)
-                    graph_node = node_encoder(
-                        graph_data.obj_id,
-                        graph_data.attr_id,
-                        graph_data.bbox,
-                        obj_hash_id=getattr(graph_data, "obj_hash_id", None),
-                        attr_hash_id=getattr(graph_data, "attr_hash_id", None),
-                        edge_index=getattr(graph_data, "edge_index", None),
-                        edge_pred_id=getattr(graph_data, "edge_pred_id", None),
-                        edge_pred_hash_id=getattr(graph_data, "edge_pred_hash_id", None),
+            ids = batch["ids"]
+            image_ids = batch["image_ids"]
+            prompts = batch["prompts"]
+            graph_list = batch["graph_list"]
+            pil_images = batch["pil_images"]
+            has_graph = batch["has_graph"]
+            has_image = batch["has_image"]
+
+            groups = {
+                "both": [i for i in range(len(ids)) if has_graph[i] and has_image[i]],
+                "graph_only": [i for i in range(len(ids)) if has_graph[i] and not has_image[i]],
+                "vision_only": [i for i in range(len(ids)) if (not has_graph[i]) and has_image[i]],
+                "text_only": [i for i in range(len(ids)) if (not has_graph[i]) and (not has_image[i])],
+            }
+
+            def run_group(idxs: List[int], use_graph: bool, use_vision_branch: bool) -> List[str]:
+                if not idxs:
+                    return []
+                prompt_texts = [build_prompt_for_tokenizer(tokenizer, prompts[i]) for i in idxs]
+                tok = tokenizer(
+                    prompt_texts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=int(args.max_length),
+                )
+                input_ids = tok["input_ids"].to(device)
+
+                graph_data = None
+                if use_graph:
+                    from torch_geometric.data import Batch as GeoBatch
+
+                    graphs = [graph_list[i] for i in idxs]
+                    graph_data = GeoBatch.from_data_list(graphs).to(device)
+                    if hasattr(graph_data, "obj_id") and hasattr(graph_data, "attr_id") and hasattr(graph_data, "bbox"):
+                        try:
+                            graph_node = model.vg_adapter(
+                                graph_data.obj_id,
+                                graph_data.attr_id,
+                                graph_data.bbox,
+                                obj_hash_id=getattr(graph_data, "obj_hash_id", None),
+                                attr_hash_id=getattr(graph_data, "attr_hash_id", None),
+                                edge_index=getattr(graph_data, "edge_index", None),
+                                edge_pred_id=getattr(graph_data, "edge_pred_id", None),
+                                edge_pred_hash_id=getattr(graph_data, "edge_pred_hash_id", None),
+                            )
+                            graph_data.graph_node = graph_node
+                            graph_data.x = graph_node
+                        except Exception:
+                            pass
+
+                pixel_values = None
+                if use_vision_branch:
+                    images = [pil_images[i] for i in idxs]
+                    pixel_values = processor(images=images, return_tensors="pt")["pixel_values"].to(device)
+
+                with autocast_ctx(dtype=amp_dtype, enabled=amp_dtype is not None):
+                    inputs_embeds = model.llm.model.get_input_embeddings()(input_ids)
+                    target_dtype = inputs_embeds.dtype
+                    embeds_list = []
+
+                    if graph_data is not None:
+                        graph_tokens = model.graph_branch(graph_data)
+                        graph_embeds = model.gl_projector(graph_tokens)
+                        if graph_embeds.dtype != target_dtype:
+                            graph_embeds = graph_embeds.to(target_dtype)
+                        embeds_list.append(graph_embeds)
+
+                    if pixel_values is not None and model.vision_branch is not None and model.vl_projector is not None:
+                        vision_tokens = model.vision_branch(pixel_values)
+                        vision_embeds = model.vl_projector(vision_tokens)
+                        if vision_embeds.dtype != target_dtype:
+                            vision_embeds = vision_embeds.to(target_dtype)
+                        embeds_list.append(vision_embeds)
+
+                    embeds_list.append(inputs_embeds)
+                    combined_embeds = torch.cat(embeds_list, dim=1)
+                    attention_mask = torch.ones(
+                        combined_embeds.size(0),
+                        combined_embeds.size(1),
+                        dtype=torch.long,
+                        device=combined_embeds.device,
                     )
-                    graph_data.graph_node = graph_node
-                    graph_data.x = graph_node
-                except Exception:
-                    pass
-            pixel_values = batch["pixel_values"].to(device) if batch["pixel_values"] is not None else None
 
-            # build combined embeds manually to avoid RoPE length mismatch
-            inputs_embeds = model.llm.model.get_input_embeddings()(input_ids)
-            target_dtype = inputs_embeds.dtype
-            embeds_list = []
+                    gen = model.llm.generate(
+                        inputs_embeds=combined_embeds,
+                        attention_mask=attention_mask,
+                        max_new_tokens=int(args.max_new_tokens),
+                        do_sample=False,
+                    )
+                return tokenizer.batch_decode(gen, skip_special_tokens=True)
 
-            graph_embeds = None
-            if graph_data is not None:
-                graph_tokens = model.graph_branch(graph_data)
-                graph_embeds = model.gl_projector(graph_tokens)
-                if graph_embeds.dtype != target_dtype:
-                    graph_embeds = graph_embeds.to(target_dtype)
-                embeds_list.append(graph_embeds)
+            decoded_map: Dict[int, str] = {}
+            for group_name, idxs in groups.items():
+                if not idxs:
+                    continue
+                use_graph = group_name in {"both", "graph_only"}
+                use_vision_branch = group_name in {"both", "vision_only"}
+                decoded = run_group(idxs, use_graph=use_graph, use_vision_branch=use_vision_branch)
+                for i, text in zip(idxs, decoded):
+                    decoded_map[i] = text
 
-            vision_embeds = None
-            if pixel_values is not None and model.vision_branch is not None and model.vl_projector is not None:
-                vision_tokens = model.vision_branch(pixel_values)
-                vision_embeds = model.vl_projector(vision_tokens)
-                if vision_embeds.dtype != target_dtype:
-                    vision_embeds = vision_embeds.to(target_dtype)
-                embeds_list.append(vision_embeds)
-
-            embeds_list.append(inputs_embeds)
-            combined_embeds = torch.cat(embeds_list, dim=1)
-            attention_mask = torch.ones(
-                combined_embeds.size(0), combined_embeds.size(1), dtype=torch.long, device=combined_embeds.device
-            )
-
-            gen = model.llm.generate(
-                inputs_embeds=combined_embeds,
-                attention_mask=attention_mask,
-                max_new_tokens=int(args.max_new_tokens),
-                do_sample=False,
-            )
-            decoded = tokenizer.batch_decode(gen, skip_special_tokens=True)
-
-            for i, text in enumerate(decoded):
+            for i in range(len(ids)):
+                text = decoded_map.get(i, "")
                 pred = extract_short_answer(text)
                 rec = {
-                    "id": batch["ids"][i],
+                    "id": ids[i],
                     "pred": pred,
-                    "image_id": batch["image_ids"][i],
+                    "image_id": image_ids[i],
+                    "has_graph": bool(has_graph[i]),
+                    "has_image": bool(has_image[i]),
                 }
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 seen += 1
