@@ -1,6 +1,7 @@
 # OmniGraph Standardized Infra Launcher
 
 Use this launcher to run reproducible training/eval with profile + manifest logging.
+Default strict path is now `Stage2A(no_stage1 + perceiver) -> Stage2B -> Stage3 -> GQA eval`.
 
 ## Entry
 
@@ -18,14 +19,16 @@ python scripts/train/infra_launcher.py --profile 4090 --mode stage3 --gpu 0
 python scripts/train/infra_launcher.py --profile 4090 --mode eval   --gpu 0
 ```
 
-After Stage1 retraining, point Stage2A to the produced ckpt:
+Legacy rollback (Stage1 + QFormer):
 
 ```bash
 ./train_infra.sh --profile 4090 --mode stage2a --gpu 0 \
+  --set GRAPH_TOKENIZER_TYPE=qformer \
+  --set STAGE2A_BOOTSTRAP_MODE=legacy_stage1 \
   --set STAGE1_QFORMER_CKPT=/absolute/path/to/runs/<run_id>/checkpoints/graph_qformer_stage1.pt
 ```
 
-Optional Stage1 stop controls:
+Optional Stage1 stop controls (legacy path only):
 
 ```bash
 ./train_infra.sh --profile 4090 --mode stage1 --gpu 0 \

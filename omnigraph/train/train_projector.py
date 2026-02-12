@@ -405,6 +405,30 @@ def load_stage1_qformer_weights(model: OmniGraphModel, stage1_qformer_ckpt: str)
     return info
 
 
+def _resolve_stage2a_bootstrap_mode(
+    requested_mode: str,
+    graph_tokenizer_type: str,
+    stage1_qformer_ckpt: Optional[str],
+) -> str:
+    mode = str(requested_mode or "auto").strip().lower()
+    tok = str(graph_tokenizer_type or "qformer").strip().lower()
+    if tok not in {"qformer", "perceiver"}:
+        raise ValueError(f"Unsupported graph_tokenizer_type: {graph_tokenizer_type}")
+
+    if mode == "auto":
+        mode = "legacy_stage1" if tok == "qformer" else "no_stage1"
+
+    if mode not in {"legacy_stage1", "no_stage1"}:
+        raise ValueError(f"Unsupported stage2A bootstrap mode: {requested_mode}")
+
+    if mode == "legacy_stage1":
+        if tok != "qformer":
+            raise ValueError("legacy_stage1 mode requires graph_tokenizer_type=qformer.")
+        if not stage1_qformer_ckpt:
+            raise ValueError("legacy_stage1 mode requires --stage1_qformer_ckpt.")
+    return mode
+
+
 # ---------------------------------------------------------------------------
 # LightningModule (Stage2-A)
 # ---------------------------------------------------------------------------
@@ -416,7 +440,7 @@ class ProjectorPL(pl.LightningModule):
         - vg_adapter
         - gl_projector
       Freeze:
-        - graph_qformer (explicit)
+        - graph_qformer in legacy_stage1 bootstrap mode
         - LLM
         - graphgpt
         - vision (disabled)
@@ -428,12 +452,19 @@ class ProjectorPL(pl.LightningModule):
         graph_model_name: str,
         num_obj: int,
         num_attr: int,
-        stage1_qformer_ckpt: str,
         lr: float,
         max_length: int,
+        stage1_qformer_ckpt: Optional[str] = None,
+        stage2A_bootstrap_mode: str = "auto",
         max_graph_tokens: int | None = None,
         llm_dtype: str = "bfloat16",
         llm_attn_implementation: str = "sdpa",
+        graph_tokenizer_type: str = "perceiver",
+        perceiver_num_latents: int = 32,
+        perceiver_num_layers: int = 3,
+        perceiver_num_heads: int = 8,
+        perceiver_ff_mult: int = 4,
+        perceiver_dropout: float = 0.0,
         node_encoder_type: str = "hybrid",
         node_encoder_out_dim: int = 128,
         train_node_encoder: bool = True,
@@ -462,6 +493,12 @@ class ProjectorPL(pl.LightningModule):
             max_graph_tokens=max_graph_tokens,
             llm_dtype=llm_dtype,
             llm_attn_implementation=llm_attn_implementation,
+            graph_tokenizer_type=str(graph_tokenizer_type),
+            perceiver_num_latents=int(perceiver_num_latents),
+            perceiver_num_layers=int(perceiver_num_layers),
+            perceiver_num_heads=int(perceiver_num_heads),
+            perceiver_ff_mult=int(perceiver_ff_mult),
+            perceiver_dropout=float(perceiver_dropout),
             node_encoder_type=node_encoder_type,
             node_encoder_out_dim=int(node_encoder_out_dim),
             node_encoder_trainable=bool(train_node_encoder),
@@ -472,7 +509,19 @@ class ProjectorPL(pl.LightningModule):
             enable_graph_aux_head=bool(enable_graph_aux_head),
             graph_aux_dropout=0.1,
         )
-        self.stage1_load_info = load_stage1_qformer_weights(self.model, stage1_qformer_ckpt)
+        self.stage2A_bootstrap_mode = _resolve_stage2a_bootstrap_mode(
+            requested_mode=str(stage2A_bootstrap_mode),
+            graph_tokenizer_type=str(graph_tokenizer_type),
+            stage1_qformer_ckpt=stage1_qformer_ckpt,
+        )
+        self.stage1_load_info: Optional[Dict[str, Any]] = None
+        if self.stage2A_bootstrap_mode == "legacy_stage1":
+            self.stage1_load_info = load_stage1_qformer_weights(self.model, str(stage1_qformer_ckpt))
+        self.stage2A_bootstrap = {
+            "mode": str(self.stage2A_bootstrap_mode),
+            "graph_tokenizer_type": str(self.model.graph_tokenizer_config.get("type", str(graph_tokenizer_type))),
+            "stage1_qformer_ckpt": str(stage1_qformer_ckpt) if stage1_qformer_ckpt else None,
+        }
         self.graph_aux_loss_weight = max(0.0, float(graph_aux_loss_weight))
         self.enable_xtc = bool(enable_xtc)
         self.enable_xtm = bool(enable_xtm)
@@ -499,19 +548,23 @@ class ProjectorPL(pl.LightningModule):
 
         # Stage2-A trainable selection
         self.train_node_encoder = bool(train_node_encoder)
+        self.train_graph_tokenizer = bool(self.stage2A_bootstrap_mode == "no_stage1")
         for name, p in self.model.named_parameters():
             trainable = ("gl_projector" in name) or (
                 self.train_node_encoder and (name.startswith("node_encoder.") or ("vg_adapter" in name))
             )
             if ("gvl_adapter" in name) or ("graph_aux_head" in name):
                 trainable = True
-            # graph_qformer must be frozen in stage2A
+            # Legacy Stage1 bootstrapping keeps graph tokenizer frozen.
             if "graph_qformer" in name:
-                trainable = False
+                trainable = bool(self.train_graph_tokenizer)
             p.requires_grad = bool(trainable)
         print(
             f"[Stage2A] node_encoder_type={self.model.node_encoder_type} "
-            f"train_node_encoder={self.train_node_encoder}"
+            f"train_node_encoder={self.train_node_encoder} "
+            f"graph_tokenizer={self.model.graph_tokenizer_config.get('type')} "
+            f"bootstrap_mode={self.stage2A_bootstrap_mode} "
+            f"train_graph_tokenizer={self.train_graph_tokenizer}"
         )
 
         # LLM memory-saving settings
@@ -704,6 +757,13 @@ def main():
 
     ap.add_argument("--llm", type=str, default="Qwen/Qwen2.5-7B-Instruct")
     ap.add_argument("--graph_model", type=str, default="clip_gt_arxiv_pub")
+    ap.add_argument(
+        "--stage2A_bootstrap_mode",
+        type=str,
+        default="auto",
+        choices=["auto", "no_stage1", "legacy_stage1"],
+        help="auto: perceiver=>no_stage1, qformer=>legacy_stage1",
+    )
 
     ap.add_argument("--gpu", type=int, default=0, help="GPU index; use -1 for CPU")
     ap.add_argument("--batch_size", type=int, default=2)
@@ -714,6 +774,12 @@ def main():
     ap.add_argument("--max_graph_tokens", type=int, default=0, help="If >0, truncate graph prefix tokens before LLM.")
     ap.add_argument("--llm_dtype", type=str, default="bfloat16", help="LLM load dtype: bfloat16/float16/float32.")
     ap.add_argument("--llm_attn_implementation", type=str, default="sdpa", help="LLM attention backend (e.g., sdpa/flash_attention_2).")
+    ap.add_argument("--graph_tokenizer_type", type=str, default="perceiver", choices=["qformer", "perceiver"])
+    ap.add_argument("--perceiver_num_latents", type=int, default=32)
+    ap.add_argument("--perceiver_num_layers", type=int, default=3)
+    ap.add_argument("--perceiver_num_heads", type=int, default=8)
+    ap.add_argument("--perceiver_ff_mult", type=int, default=4)
+    ap.add_argument("--perceiver_dropout", type=float, default=0.0)
     ap.add_argument("--node_encoder_type", type=str, default="hybrid", choices=["hybrid", "open_vocab", "legacy_vg"])
     ap.add_argument("--node_encoder_out_dim", type=int, default=128, help="Graph node encoder output dim.")
     ap.add_argument("--train_node_encoder", type=int, default=1, choices=[0, 1], help="1=train node encoder, 0=freeze.")
@@ -758,19 +824,35 @@ def main():
     ap.add_argument(
         "--stage1_qformer_ckpt",
         type=str,
-        required=True,
+        default="",
         help="Path to Stage1 graph_qformer checkpoint (graph_qformer_stage1.pt)",
     )
 
     args = ap.parse_args()
     pl.seed_everything(int(args.seed), workers=True)
-    print("[Pipeline] Stage2A start: requires Stage1 GraphQFormer checkpoint.")
+    stage1_ckpt_str = str(args.stage1_qformer_ckpt).strip()
+    resolved_bootstrap = _resolve_stage2a_bootstrap_mode(
+        requested_mode=str(args.stage2A_bootstrap_mode),
+        graph_tokenizer_type=str(args.graph_tokenizer_type),
+        stage1_qformer_ckpt=stage1_ckpt_str if stage1_ckpt_str else None,
+    )
+    if resolved_bootstrap == "legacy_stage1":
+        print("[Pipeline] Stage2A start: legacy_stage1 bootstrap enabled.")
+    else:
+        print("[Pipeline] Stage2A start: no_stage1 bootstrap enabled (default new pipeline).")
+    print(
+        f"[Stage2A] bootstrap_mode={resolved_bootstrap} "
+        f"graph_tokenizer_type={args.graph_tokenizer_type}"
+    )
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
-    stage1_ckpt = Path(args.stage1_qformer_ckpt)
-    if not stage1_ckpt.exists():
-        raise FileNotFoundError(f"--stage1_qformer_ckpt not found: {stage1_ckpt}")
+    stage1_ckpt: Optional[Path] = None
+    if stage1_ckpt_str:
+        stage1_ckpt = Path(stage1_ckpt_str)
+    if resolved_bootstrap == "legacy_stage1":
+        if stage1_ckpt is None or not stage1_ckpt.exists():
+            raise FileNotFoundError(f"--stage1_qformer_ckpt not found: {stage1_ckpt_str}")
 
     # 1) build vocabs
     obj_vocab, pred_vocab, attr_vocab = build_vg_vocabs_from_file(args.scene_graphs, min_freq=args.min_freq)
@@ -859,12 +941,19 @@ def main():
         graph_model_name=args.graph_model,
         num_obj=int(num_obj),
         num_attr=int(num_attr),
-        stage1_qformer_ckpt=str(stage1_ckpt),
         lr=float(args.lr),
         max_length=int(args.max_length),
+        stage1_qformer_ckpt=(str(stage1_ckpt) if stage1_ckpt else None),
+        stage2A_bootstrap_mode=str(args.stage2A_bootstrap_mode),
         max_graph_tokens=(int(args.max_graph_tokens) if int(args.max_graph_tokens) > 0 else None),
         llm_dtype=str(args.llm_dtype),
         llm_attn_implementation=str(args.llm_attn_implementation),
+        graph_tokenizer_type=str(args.graph_tokenizer_type),
+        perceiver_num_latents=int(args.perceiver_num_latents),
+        perceiver_num_layers=int(args.perceiver_num_layers),
+        perceiver_num_heads=int(args.perceiver_num_heads),
+        perceiver_ff_mult=int(args.perceiver_ff_mult),
+        perceiver_dropout=float(args.perceiver_dropout),
         node_encoder_type=str(args.node_encoder_type),
         node_encoder_out_dim=int(args.node_encoder_out_dim),
         train_node_encoder=bool(train_node_encoder),
@@ -931,10 +1020,12 @@ def main():
     torch.save(pl_model.model.state_dict(), str(export_path))
     stage_meta = {
         "stage": "stage2A",
-        "stage1_qformer_ckpt": str(stage1_ckpt),
+        "stage1_qformer_ckpt": str(stage1_ckpt) if stage1_ckpt else None,
         "num_obj": int(num_obj),
         "num_attr": int(num_attr),
+        "stage2A_bootstrap": pl_model.stage2A_bootstrap,
         "stage1_load_info": pl_model.stage1_load_info,
+        "graph_tokenizer_config": pl_model.model.graph_tokenizer_config,
         "node_encoder_config": pl_model.model.node_encoder_config,
         "architecture_config": pl_model.model.architecture_config,
         "alignment_config": pl_model.alignment_config,

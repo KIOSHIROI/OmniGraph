@@ -5,7 +5,7 @@
 - Commit:
 - GPU:
 - Precision:
-- Pipeline: `Stage1 -> Stage2A -> Stage2B -> Stage3 -> GQA val_balanced`
+- Pipeline: `Stage2A(no_stage1 + perceiver) -> Stage2B -> Stage3 -> GQA val_balanced`
 - Data:
   - Train: VG region + synthetic graph QA
   - Eval: GQA `val_balanced` (no GQA training labels)
