@@ -40,6 +40,14 @@ STAGE1_NODE_TEXT_JSON_PATH=${STAGE1_NODE_TEXT_JSON_PATH:-}
 STAGE1_NODE_FEAT_NPY_PATH=${STAGE1_NODE_FEAT_NPY_PATH:-}
 STAGE1_DATASET_PATHS=${STAGE1_DATASET_PATHS:-"data/train_instruct_graphmatch.json data/arxiv_pub_node_st_cot_link_mix.json"}
 STAGE1_EXPORT_PATH=${STAGE1_EXPORT_PATH:-$WORKDIR/graph_qformer_stage1.pt}
+OMNIGRAPH_HF_CACHE=${OMNIGRAPH_HF_CACHE:-/media/disk/02drive/13hias/.cache}
+OMNIGRAPH_HF_ENDPOINT=${OMNIGRAPH_HF_ENDPOINT:-https://hf-mirror.com}
+export OMNIGRAPH_HF_CACHE OMNIGRAPH_HF_ENDPOINT
+export HF_ENDPOINT=${HF_ENDPOINT:-$OMNIGRAPH_HF_ENDPOINT}
+export HF_HOME=${HF_HOME:-$OMNIGRAPH_HF_CACHE}
+export TRANSFORMERS_CACHE=${TRANSFORMERS_CACHE:-$HF_HOME/transformers}
+export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-$HF_HOME/datasets}
+export HUGGINGFACE_HUB_CACHE=${HUGGINGFACE_HUB_CACHE:-$HF_HOME/hub}
 
 read -r -a _DATASET_PATHS_ARR <<< "$STAGE1_DATASET_PATHS"
 if [ "${#_DATASET_PATHS_ARR[@]}" -eq 0 ]; then
@@ -83,6 +91,8 @@ if [ "$GPU" -ge 0 ]; then
 fi
 
 echo "[Stage1] start GPU=${GPU} bs=${STAGE1_BATCH_SIZE} lr=${STAGE1_LR} epochs=${STAGE1_EPOCHS} max_steps=${STAGE1_MAX_STEPS} early_stop=${STAGE1_ENABLE_EARLY_STOP} patience=${STAGE1_EARLY_STOP_PATIENCE} gtm_max_len=${STAGE1_GTM_MAX_LEN}"
+echo "[Stage1] HF_ENDPOINT=${HF_ENDPOINT} HF_HOME=${HF_HOME}"
+rm -f "$WORKDIR/graph_qformer_stage1.pt"
 "${CMD[@]}"
 
 if [ ! -f "$WORKDIR/graph_qformer_stage1.pt" ]; then

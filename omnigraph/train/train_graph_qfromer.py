@@ -7,6 +7,7 @@ if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
 from omnigraph.utils.env import setup_env
+setup_env()
 
 import torch
 import torch.nn as nn
@@ -748,5 +749,11 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         print(f"Training failed: {e}")
+        print(
+            "Hint: if this is a model download/network error, set "
+            "STAGE1_TEXT_MODEL_NAME to a local model path, and/or configure "
+            "OMNIGRAPH_HF_ENDPOINT / OMNIGRAPH_HF_CACHE."
+        )
         import traceback
         traceback.print_exc()
+        raise SystemExit(1)

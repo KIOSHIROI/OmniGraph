@@ -114,6 +114,8 @@ def main() -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()
+    env.setdefault("OMNIGRAPH_HF_CACHE", "/media/disk/02drive/13hias/.cache")
+    env.setdefault("OMNIGRAPH_HF_ENDPOINT", "https://hf-mirror.com")
     env.update(profiles[args.profile])
     env.update(_resolved_paths(repo, run_dir))
     env["GPU"] = str(args.gpu)
