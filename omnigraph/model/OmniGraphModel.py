@@ -1,6 +1,7 @@
 from omnigraph.utils.env import setup_env
 
 setup_env()
+import math
 import torch
 import torch.nn as nn
 from omnigraph.model.graph.node_encoder import build_graph_node_encoder
@@ -10,6 +11,111 @@ from omnigraph.model.graph.graph_qformer import GraphQFormer, GraphQFormerConfig
 from omnigraph.model.vision.blip2_vision_qformer import BLIP2VisionQFormer
 from omnigraph.model.projector import Projector
 from omnigraph.model.llm.llama import LlamaLLM
+
+
+class GraphLanguageCrossAttentionAdapter(nn.Module):
+    """
+    Lightweight graph/vision -> language adapter.
+    Query: text embeddings
+    Key/Value: multimodal prefix embeddings (graph + vision)
+    """
+
+    def __init__(self, hidden_size: int, num_heads: int = 8, gate_init: float = 0.1, dropout: float = 0.0) -> None:
+        super().__init__()
+        h = int(hidden_size)
+        nh = max(1, int(num_heads))
+        if h % nh != 0:
+            nh = 1
+        self.text_norm = nn.LayerNorm(h)
+        self.ctx_norm = nn.LayerNorm(h)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=h,
+            num_heads=nh,
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.ffn_norm = nn.LayerNorm(h)
+        self.ffn = nn.Sequential(
+            nn.Linear(h, h),
+            nn.GELU(),
+            nn.Linear(h, h),
+        )
+
+        g = min(1.0 - 1e-5, max(1e-5, float(gate_init)))
+        self.gate_logit = nn.Parameter(torch.tensor(math.log(g / (1.0 - g)), dtype=torch.float32))
+
+    def forward(self, text_embeds: torch.Tensor, context_embeds: torch.Tensor | None) -> torch.Tensor:
+        if context_embeds is None or context_embeds.numel() == 0:
+            return text_embeds
+
+        q = self.text_norm(text_embeds)
+        kv = self.ctx_norm(context_embeds)
+        attn_out, _ = self.cross_attn(q, kv, kv, need_weights=False)
+
+        gate = torch.sigmoid(self.gate_logit).to(dtype=text_embeds.dtype, device=text_embeds.device)
+        mixed = text_embeds + gate * attn_out
+        ffn_out = self.ffn(self.ffn_norm(mixed))
+        return mixed + gate * ffn_out
+
+
+class GraphReasoningAuxHead(nn.Module):
+    """
+    Auxiliary binary head for graph reasoning types (verify/logical/compare).
+    """
+
+    def __init__(self, hidden_size: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        h = int(hidden_size)
+        self.graph_norm = nn.LayerNorm(h)
+        self.text_norm = nn.LayerNorm(h)
+        self.mlp = nn.Sequential(
+            nn.Linear(h * 4, h),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(h, h),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+        )
+        self.classifier = nn.Linear(h, 2)
+
+    @staticmethod
+    def _masked_mean(x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+        if mask is None:
+            return x.mean(dim=1)
+        m = mask.to(dtype=x.dtype, device=x.device)
+        if m.dim() == 1:
+            m = m.unsqueeze(0)
+        while m.dim() < x.dim():
+            m = m.unsqueeze(-1)
+        denom = m.sum(dim=1).clamp_min(1e-6)
+        return (x * m).sum(dim=1) / denom
+
+    def forward(
+        self,
+        graph_embeds: torch.Tensor,
+        text_embeds: torch.Tensor,
+        text_attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        g = self.graph_norm(graph_embeds).mean(dim=1)
+        t = self.text_norm(text_embeds)
+        t = self._masked_mean(t, text_attention_mask)
+        fused = torch.cat([g, t, torch.abs(g - t), g * t], dim=-1)
+        hidden = self.mlp(fused)
+        return self.classifier(hidden)
+
+    @staticmethod
+    def loss(
+        logits: torch.Tensor,
+        labels: torch.Tensor | None,
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if labels is None or mask is None:
+            return None
+        valid = (mask > 0) & (labels >= 0)
+        if valid.sum().item() <= 0:
+            return None
+        return nn.functional.cross_entropy(logits[valid], labels[valid])
+
 
 class OmniGraphModel(nn.Module):
     def __init__(self,
@@ -33,6 +139,11 @@ class OmniGraphModel(nn.Module):
                  node_encoder_out_dim: int = 128,
                  node_encoder_trainable: bool = True,
                  node_encoder_alpha_init: float = 0.3,
+                 enable_gvl_adapter: bool = True,
+                 gvl_adapter_num_heads: int = 8,
+                 gvl_adapter_gate_init: float = 0.1,
+                 enable_graph_aux_head: bool = True,
+                 graph_aux_dropout: float = 0.1,
                  ):
         super().__init__()
         if num_obj is None or num_attr is None:
@@ -68,6 +179,8 @@ class OmniGraphModel(nn.Module):
             "trainable": bool(self.node_encoder_trainable),
             "alpha_init": float(self.node_encoder_alpha_init),
         }
+        self.enable_gvl_adapter = bool(enable_gvl_adapter)
+        self.enable_graph_aux_head = bool(enable_graph_aux_head)
         # 1. LLM (Frozen, bf16)
         print(f"Loading LLM: {llm_model_name}...")
         self.llm = LlamaLLM(
@@ -77,6 +190,31 @@ class OmniGraphModel(nn.Module):
             attn_implementation=llm_attn_implementation,
         )
         self.hidden_size = self.llm.config.hidden_size
+        if self.enable_gvl_adapter:
+            self.gvl_adapter = GraphLanguageCrossAttentionAdapter(
+                hidden_size=self.hidden_size,
+                num_heads=int(gvl_adapter_num_heads),
+                gate_init=float(gvl_adapter_gate_init),
+                dropout=0.0,
+            )
+        else:
+            self.gvl_adapter = None
+
+        if self.enable_graph_aux_head:
+            self.graph_aux_head = GraphReasoningAuxHead(
+                hidden_size=self.hidden_size,
+                dropout=float(graph_aux_dropout),
+            )
+        else:
+            self.graph_aux_head = None
+
+        self.architecture_config = {
+            "enable_gvl_adapter": bool(self.enable_gvl_adapter),
+            "gvl_adapter_num_heads": int(gvl_adapter_num_heads),
+            "gvl_adapter_gate_init": float(gvl_adapter_gate_init),
+            "enable_graph_aux_head": bool(self.enable_graph_aux_head),
+            "graph_aux_dropout": float(graph_aux_dropout),
+        }
         
         # 2. Graph Branch
         print("Loading Graph Branch...")
@@ -167,6 +305,17 @@ class OmniGraphModel(nn.Module):
             return tokens
         return tokens[:, :max_tokens, :]
 
+    @staticmethod
+    def _attach_output_field(outputs, key: str, value):
+        try:
+            outputs[key] = value
+        except Exception:
+            pass
+        try:
+            setattr(outputs, key, value)
+        except Exception:
+            pass
+
     @property
     def vg_adapter(self):
         # Backward-compatible view for legacy call-sites.
@@ -198,6 +347,10 @@ class OmniGraphModel(nn.Module):
                 graph_data=None, # Expecting object with input_ids, attention_mask for GraphGPT
                 pixel_values=None, # (B, 3, H, W)
                 labels=None,
+                aux_binary_labels: torch.Tensor | None = None,
+                aux_binary_mask: torch.Tensor | None = None,
+                aux_loss_weight: float = 0.0,
+                return_alignment_features: bool = False,
                 return_debug: bool = False
                 ):
         
@@ -207,9 +360,7 @@ class OmniGraphModel(nn.Module):
         
         batch_size = inputs_embeds.shape[0]
         device = inputs_embeds.device
-        
-        # List to hold embeddings to concatenate: [Graph, Vision, Text]
-        embeds_list = []
+        text_attention_mask = attention_mask
         
         # 1. Process Graph Data
         # Support missing modality: if graph_data is None, skip adding tokens
@@ -231,7 +382,6 @@ class OmniGraphModel(nn.Module):
                 debug["graph_prefix_tokens"] = int(graph_embeds.shape[1])
             if graph_embeds.dtype != target_dtype:
                 graph_embeds = graph_embeds.to(target_dtype)
-            embeds_list.append(graph_embeds)
 
         # 2. Process Vision Data
         # Support missing modality: if pixel_values is None, skip adding tokens
@@ -250,12 +400,45 @@ class OmniGraphModel(nn.Module):
                 debug["vision_prefix_tokens"] = int(vision_embeds.shape[1])
             if vision_embeds.dtype != target_dtype:
                 vision_embeds = vision_embeds.to(target_dtype)
+
+        context_tokens = []
+        if graph_embeds is not None:
+            context_tokens.append(graph_embeds)
+        if vision_embeds is not None:
+            context_tokens.append(vision_embeds)
+        context_embeds = torch.cat(context_tokens, dim=1) if context_tokens else None
+
+        text_embeds = inputs_embeds
+        if self.gvl_adapter is not None and context_embeds is not None:
+            text_embeds = self.gvl_adapter(text_embeds, context_embeds)
+            if return_debug:
+                debug["text_after_adapter_nan"] = bool(torch.isnan(text_embeds).any().item())
+                debug["text_after_adapter_inf"] = bool(torch.isinf(text_embeds).any().item())
+
+        aux_logits = None
+        aux_loss = None
+        if self.graph_aux_head is not None and graph_embeds is not None:
+            aux_logits = self.graph_aux_head(
+                graph_embeds=graph_embeds,
+                text_embeds=text_embeds,
+                text_attention_mask=text_attention_mask,
+            )
+            aux_loss = self.graph_aux_head.loss(
+                logits=aux_logits,
+                labels=aux_binary_labels,
+                mask=aux_binary_mask,
+            )
+            if return_debug:
+                debug["aux_logits_nan"] = bool(torch.isnan(aux_logits).any().item())
+                debug["aux_logits_inf"] = bool(torch.isinf(aux_logits).any().item())
+
+        # 3. Concatenate embeddings [Graph, Vision, Text]
+        embeds_list = []
+        if graph_embeds is not None:
+            embeds_list.append(graph_embeds)
+        if vision_embeds is not None:
             embeds_list.append(vision_embeds)
-            
-        # 3. Add Text Embeddings
-        embeds_list.append(inputs_embeds)
-        
-        # Concatenate
+        embeds_list.append(text_embeds)
         combined_embeds = torch.cat(embeds_list, dim=1)
         if return_debug:
             debug["combined_embeds_nan"] = bool(torch.isnan(combined_embeds).any().item())
@@ -287,6 +470,29 @@ class OmniGraphModel(nn.Module):
             attention_mask=attention_mask,
             labels=labels
         )
+
+        if return_alignment_features:
+            if graph_embeds is not None:
+                self._attach_output_field(outputs, "graph_embeds", graph_embeds)
+            if vision_embeds is not None:
+                self._attach_output_field(outputs, "vision_embeds", vision_embeds)
+            self._attach_output_field(outputs, "text_embeds", text_embeds)
+            if text_attention_mask is not None:
+                self._attach_output_field(outputs, "text_attention_mask", text_attention_mask)
+
+        if aux_logits is not None:
+            self._attach_output_field(outputs, "aux_logits", aux_logits)
+        if aux_loss is not None:
+            self._attach_output_field(outputs, "aux_loss", aux_loss)
+            self._attach_output_field(outputs, "aux_loss_weight", float(aux_loss_weight))
+            w = max(0.0, float(aux_loss_weight))
+            if w > 0.0:
+                base_loss = getattr(outputs, "loss", None)
+                aux_term = aux_loss * w
+                if base_loss is None:
+                    outputs.loss = aux_term
+                else:
+                    outputs.loss = base_loss + aux_term
         
         if return_debug:
             return outputs, debug
@@ -296,9 +502,8 @@ class OmniGraphModel(nn.Module):
         # Get LLM token embeddings
         inputs_embeds = self.llm.model.get_input_embeddings()(input_ids)
         target_dtype = inputs_embeds.dtype
-        
-        embeds_list = []
-        
+
+        graph_embeds = None
         if graph_data is not None:
             graph_data = self._inject_graph_node_features(graph_data)
             graph_tokens = self.graph_branch(graph_data)
@@ -306,17 +511,32 @@ class OmniGraphModel(nn.Module):
             graph_embeds = self._truncate_prefix_tokens(graph_embeds, self.max_graph_tokens)
             if graph_embeds.dtype != target_dtype:
                 graph_embeds = graph_embeds.to(target_dtype)
-            embeds_list.append(graph_embeds)
-            
+
+        vision_embeds = None
         if pixel_values is not None and self.vision_branch is not None and self.vl_projector is not None:
             vision_tokens = self.vision_branch(pixel_values)
             vision_embeds = self.vl_projector(vision_tokens)
             vision_embeds = self._truncate_prefix_tokens(vision_embeds, self.max_vision_tokens)
             if vision_embeds.dtype != target_dtype:
                 vision_embeds = vision_embeds.to(target_dtype)
+
+        context_tokens = []
+        if graph_embeds is not None:
+            context_tokens.append(graph_embeds)
+        if vision_embeds is not None:
+            context_tokens.append(vision_embeds)
+        context_embeds = torch.cat(context_tokens, dim=1) if context_tokens else None
+
+        text_embeds = inputs_embeds
+        if self.gvl_adapter is not None and context_embeds is not None:
+            text_embeds = self.gvl_adapter(text_embeds, context_embeds)
+
+        embeds_list = []
+        if graph_embeds is not None:
+            embeds_list.append(graph_embeds)
+        if vision_embeds is not None:
             embeds_list.append(vision_embeds)
-            
-        embeds_list.append(inputs_embeds)
+        embeds_list.append(text_embeds)
         combined_embeds = torch.cat(embeds_list, dim=1)
             
         return self.llm.generate(inputs_embeds=combined_embeds, **kwargs)

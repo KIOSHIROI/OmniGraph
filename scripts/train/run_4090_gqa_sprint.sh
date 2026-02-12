@@ -34,6 +34,40 @@ LOW_VRAM_4090=${LOW_VRAM_4090:-0}
 AUTO_BATCH_RETRY_ON_OOM=${AUTO_BATCH_RETRY_ON_OOM:-1}
 AUTO_BATCH_MAX_RETRIES=${AUTO_BATCH_MAX_RETRIES:-8}
 AUTO_BATCH_SCALE=${AUTO_BATCH_SCALE:-1.0}
+PIPELINE_MODE=${PIPELINE_MODE:-full}
+PIPELINE_MODE=$(printf "%s" "$PIPELINE_MODE" | tr '[:upper:]' '[:lower:]')
+
+RUN_STAGE2A=0
+RUN_STAGE2B=0
+RUN_STAGE3=0
+RUN_EVAL=0
+case "$PIPELINE_MODE" in
+  full)
+    RUN_STAGE2A=1
+    RUN_STAGE2B=1
+    RUN_STAGE3=1
+    RUN_EVAL=1
+    ;;
+  stage2a)
+    RUN_STAGE2A=1
+    ;;
+  stage2b)
+    RUN_STAGE2B=1
+    ;;
+  stage3)
+    RUN_STAGE3=1
+    ;;
+  eval)
+    RUN_EVAL=1
+    ;;
+  *)
+    echo "[Config] invalid PIPELINE_MODE=${PIPELINE_MODE} (expected: full|stage2a|stage2b|stage3|eval)"
+    exit 1
+    ;;
+esac
+if [ "$PIPELINE_MODE" != "full" ]; then
+  RUN_ROUND2_ON_FAIL=0
+fi
 
 # Keep track of whether user explicitly set batch size env vars.
 USER_SET_S2A_BATCH_SIZE=${S2A_BATCH_SIZE+x}
@@ -51,6 +85,29 @@ VISION_MODEL=${VISION_MODEL:-Salesforce/blip2-flan-t5-xl}
 NODE_ENCODER_TYPE=${NODE_ENCODER_TYPE:-hybrid}
 NODE_ENCODER_ALPHA_INIT=${NODE_ENCODER_ALPHA_INIT:-0.3}
 NODE_ENCODER_OUT_DIM=${NODE_ENCODER_OUT_DIM:-128}
+USE_QA_TYPE_TOKEN=${USE_QA_TYPE_TOKEN:-1}
+ENABLE_GVL_ADAPTER=${ENABLE_GVL_ADAPTER:-1}
+GVL_ADAPTER_GATE_INIT=${GVL_ADAPTER_GATE_INIT:-0.1}
+ENABLE_GRAPH_AUX_HEAD=${ENABLE_GRAPH_AUX_HEAD:-1}
+S2A_GRAPH_AUX_LOSS_WEIGHT=${S2A_GRAPH_AUX_LOSS_WEIGHT:-0.04}
+S2B_GRAPH_AUX_LOSS_WEIGHT=${S2B_GRAPH_AUX_LOSS_WEIGHT:-0.08}
+S3_GRAPH_AUX_LOSS_WEIGHT=${S3_GRAPH_AUX_LOSS_WEIGHT:-0.03}
+S2B_R2_GRAPH_AUX_LOSS_WEIGHT=${S2B_R2_GRAPH_AUX_LOSS_WEIGHT:-0.10}
+S3_R2_GRAPH_AUX_LOSS_WEIGHT=${S3_R2_GRAPH_AUX_LOSS_WEIGHT:-0.04}
+ENABLE_XTC=${ENABLE_XTC:-1}
+ENABLE_XTM=${ENABLE_XTM:-1}
+XTC_LOGIT_SCALE_INIT=${XTC_LOGIT_SCALE_INIT:-2.66}
+XTM_DUP_THRESH=${XTM_DUP_THRESH:-0.98}
+S2A_XTC_WEIGHT=${S2A_XTC_WEIGHT:-0.08}
+S2A_XTM_WEIGHT=${S2A_XTM_WEIGHT:-0.05}
+S2B_XTC_WEIGHT=${S2B_XTC_WEIGHT:-0.15}
+S2B_XTM_WEIGHT=${S2B_XTM_WEIGHT:-0.10}
+S3_XTC_WEIGHT=${S3_XTC_WEIGHT:-0.05}
+S3_XTM_WEIGHT=${S3_XTM_WEIGHT:-0.03}
+S2B_R2_XTC_WEIGHT=${S2B_R2_XTC_WEIGHT:-$S2B_XTC_WEIGHT}
+S2B_R2_XTM_WEIGHT=${S2B_R2_XTM_WEIGHT:-$S2B_XTM_WEIGHT}
+S3_R2_XTC_WEIGHT=${S3_R2_XTC_WEIGHT:-$S3_XTC_WEIGHT}
+S3_R2_XTM_WEIGHT=${S3_R2_XTM_WEIGHT:-$S3_XTM_WEIGHT}
 
 if [ "$LOW_VRAM_4090" = "1" ]; then
   if [ "$LLM_MODEL" = "$DEFAULT_LLM_7B" ]; then
@@ -64,9 +121,8 @@ if [ "$LOW_VRAM_4090" = "1" ]; then
   : "${S2A_PRECISION:=16-mixed}"
   : "${S2A_ACCUM_GRAD_BATCHES:=4}"
   : "${S2A_NUM_SANITY_VAL_STEPS:=0}"
-  : "${S2A_VAL_CHECK_INTERVAL:=1000}"
+  : "${S2A_VAL_CHECK_INTERVAL:=5000}"
   : "${S2A_LIMIT_VAL_BATCHES:=0.002}"
-  : "${S2A_FREEZE_VG_ADAPTER:=0}"
   : "${S2A_TRAIN_NODE_ENCODER:=1}"
 
   : "${S2B_BATCH_SIZE:=1}"
@@ -76,9 +132,8 @@ if [ "$LOW_VRAM_4090" = "1" ]; then
   : "${S2B_PRECISION:=16-mixed}"
   : "${S2B_ACCUM_GRAD_BATCHES:=4}"
   : "${S2B_NUM_SANITY_VAL_STEPS:=0}"
-  : "${S2B_VAL_CHECK_INTERVAL:=1000}"
+  : "${S2B_VAL_CHECK_INTERVAL:=5000}"
   : "${S2B_LIMIT_VAL_BATCHES:=0.002}"
-  : "${S2B_FREEZE_VG_ADAPTER:=0}"
   : "${S2B_TRAIN_NODE_ENCODER:=1}"
 
   : "${S3_BATCH_SIZE:=1}"
@@ -89,7 +144,7 @@ if [ "$LOW_VRAM_4090" = "1" ]; then
   : "${S3_PRECISION:=16-mixed}"
   : "${S3_ACCUM_GRAD_BATCHES:=4}"
   : "${S3_NUM_SANITY_VAL_STEPS:=0}"
-  : "${S3_VAL_CHECK_INTERVAL:=1000}"
+  : "${S3_VAL_CHECK_INTERVAL:=5000}"
   : "${S3_LIMIT_VAL_BATCHES:=0.002}"
   : "${S3_TRAIN_NODE_ENCODER:=0}"
 
@@ -100,9 +155,8 @@ if [ "$LOW_VRAM_4090" = "1" ]; then
   : "${S2B_R2_PRECISION:=16-mixed}"
   : "${S2B_R2_ACCUM_GRAD_BATCHES:=4}"
   : "${S2B_R2_NUM_SANITY_VAL_STEPS:=0}"
-  : "${S2B_R2_VAL_CHECK_INTERVAL:=1000}"
+  : "${S2B_R2_VAL_CHECK_INTERVAL:=5000}"
   : "${S2B_R2_LIMIT_VAL_BATCHES:=0.002}"
-  : "${S2B_R2_FREEZE_VG_ADAPTER:=0}"
   : "${S2B_R2_TRAIN_NODE_ENCODER:=1}"
 
   : "${S3_R2_BATCH_SIZE:=1}"
@@ -113,75 +167,107 @@ if [ "$LOW_VRAM_4090" = "1" ]; then
   : "${S3_R2_PRECISION:=16-mixed}"
   : "${S3_R2_ACCUM_GRAD_BATCHES:=4}"
   : "${S3_R2_NUM_SANITY_VAL_STEPS:=0}"
-  : "${S3_R2_VAL_CHECK_INTERVAL:=1000}"
+  : "${S3_R2_VAL_CHECK_INTERVAL:=5000}"
   : "${S3_R2_LIMIT_VAL_BATCHES:=0.002}"
   : "${S3_R2_TRAIN_NODE_ENCODER:=0}"
 else
   : "${S2A_BATCH_SIZE:=12}"
-  : "${S2A_MAX_LENGTH:=256}"
-  : "${S2A_MAX_GRAPH_TOKENS:=32}"
+  : "${S2A_MAX_LENGTH:=128}"
+  : "${S2A_MAX_GRAPH_TOKENS:=24}"
   : "${S2A_NUM_WORKERS:=8}"
   : "${S2A_PRECISION:=16-mixed}"
-  : "${S2A_ACCUM_GRAD_BATCHES:=4}"
+  : "${S2A_ACCUM_GRAD_BATCHES:=2}"
   : "${S2A_NUM_SANITY_VAL_STEPS:=0}"
-  : "${S2A_VAL_CHECK_INTERVAL:=1000}"
+  : "${S2A_VAL_CHECK_INTERVAL:=5000}"
   : "${S2A_LIMIT_VAL_BATCHES:=0.002}"
-  : "${S2A_FREEZE_VG_ADAPTER:=0}"
   : "${S2A_TRAIN_NODE_ENCODER:=1}"
 
   : "${S2B_BATCH_SIZE:=12}"
-  : "${S2B_MAX_LENGTH:=256}"
-  : "${S2B_MAX_GRAPH_TOKENS:=32}"
+  : "${S2B_MAX_LENGTH:=128}"
+  : "${S2B_MAX_GRAPH_TOKENS:=24}"
   : "${S2B_NUM_WORKERS:=8}"
   : "${S2B_PRECISION:=16-mixed}"
-  : "${S2B_ACCUM_GRAD_BATCHES:=4}"
+  : "${S2B_ACCUM_GRAD_BATCHES:=2}"
   : "${S2B_NUM_SANITY_VAL_STEPS:=0}"
-  : "${S2B_VAL_CHECK_INTERVAL:=1000}"
+  : "${S2B_VAL_CHECK_INTERVAL:=5000}"
   : "${S2B_LIMIT_VAL_BATCHES:=0.002}"
-  : "${S2B_FREEZE_VG_ADAPTER:=0}"
   : "${S2B_TRAIN_NODE_ENCODER:=1}"
 
   : "${S3_BATCH_SIZE:=6}"
-  : "${S3_MAX_LENGTH:=256}"
-  : "${S3_MAX_GRAPH_TOKENS:=32}"
-  : "${S3_MAX_VISION_TOKENS:=32}"
+  : "${S3_MAX_LENGTH:=128}"
+  : "${S3_MAX_GRAPH_TOKENS:=24}"
+  : "${S3_MAX_VISION_TOKENS:=24}"
   : "${S3_NUM_WORKERS:=4}"
   : "${S3_PRECISION:=16-mixed}"
-  : "${S3_ACCUM_GRAD_BATCHES:=4}"
+  : "${S3_ACCUM_GRAD_BATCHES:=2}"
   : "${S3_NUM_SANITY_VAL_STEPS:=0}"
-  : "${S3_VAL_CHECK_INTERVAL:=1000}"
+  : "${S3_VAL_CHECK_INTERVAL:=5000}"
   : "${S3_LIMIT_VAL_BATCHES:=0.002}"
   : "${S3_TRAIN_NODE_ENCODER:=0}"
 
   : "${S2B_R2_BATCH_SIZE:=12}"
-  : "${S2B_R2_MAX_LENGTH:=256}"
-  : "${S2B_R2_MAX_GRAPH_TOKENS:=32}"
+  : "${S2B_R2_MAX_LENGTH:=128}"
+  : "${S2B_R2_MAX_GRAPH_TOKENS:=24}"
   : "${S2B_R2_NUM_WORKERS:=8}"
   : "${S2B_R2_PRECISION:=16-mixed}"
-  : "${S2B_R2_ACCUM_GRAD_BATCHES:=4}"
+  : "${S2B_R2_ACCUM_GRAD_BATCHES:=2}"
   : "${S2B_R2_NUM_SANITY_VAL_STEPS:=0}"
-  : "${S2B_R2_VAL_CHECK_INTERVAL:=1000}"
+  : "${S2B_R2_VAL_CHECK_INTERVAL:=5000}"
   : "${S2B_R2_LIMIT_VAL_BATCHES:=0.002}"
-  : "${S2B_R2_FREEZE_VG_ADAPTER:=0}"
   : "${S2B_R2_TRAIN_NODE_ENCODER:=1}"
 
   : "${S3_R2_BATCH_SIZE:=6}"
-  : "${S3_R2_MAX_LENGTH:=256}"
-  : "${S3_R2_MAX_GRAPH_TOKENS:=32}"
-  : "${S3_R2_MAX_VISION_TOKENS:=32}"
+  : "${S3_R2_MAX_LENGTH:=128}"
+  : "${S3_R2_MAX_GRAPH_TOKENS:=24}"
+  : "${S3_R2_MAX_VISION_TOKENS:=24}"
   : "${S3_R2_NUM_WORKERS:=4}"
   : "${S3_R2_PRECISION:=16-mixed}"
-  : "${S3_R2_ACCUM_GRAD_BATCHES:=4}"
+  : "${S3_R2_ACCUM_GRAD_BATCHES:=2}"
   : "${S3_R2_NUM_SANITY_VAL_STEPS:=0}"
-  : "${S3_R2_VAL_CHECK_INTERVAL:=1000}"
+  : "${S3_R2_VAL_CHECK_INTERVAL:=5000}"
   : "${S3_R2_LIMIT_VAL_BATCHES:=0.002}"
   : "${S3_R2_TRAIN_NODE_ENCODER:=0}"
 fi
 
-# Compatibility override for existing flags.
-if [ "${S2A_FREEZE_VG_ADAPTER}" = "1" ]; then S2A_TRAIN_NODE_ENCODER=0; fi
-if [ "${S2B_FREEZE_VG_ADAPTER}" = "1" ]; then S2B_TRAIN_NODE_ENCODER=0; fi
-if [ "${S2B_R2_FREEZE_VG_ADAPTER}" = "1" ]; then S2B_R2_TRAIN_NODE_ENCODER=0; fi
+: "${S2A_GRAPH_QA_MAX_PER_IMAGE:=5}"
+: "${S2A_GRAPH_QA_REPEAT:=3}"
+: "${S2A_VAL_RATIO:=0.02}"
+: "${S2A_PATIENCE:=16}"
+: "${S2A_MIN_DELTA:=0.0005}"
+: "${S2A_LR:=2e-5}"
+: "${S2A_MAX_STEPS:=100000}"
+
+: "${S2B_GRAPH_QA_MAX_PER_IMAGE:=6}"
+: "${S2B_GRAPH_QA_REPEAT:=6}"
+: "${S2B_VAL_RATIO:=0.02}"
+: "${S2B_PATIENCE:=18}"
+: "${S2B_MIN_DELTA:=0.0003}"
+: "${S2B_LR:=9e-6}"
+: "${S2B_MAX_STEPS:=100000}"
+
+: "${S3_GRAPH_QA_MAX_PER_IMAGE:=4}"
+: "${S3_GRAPH_QA_REPEAT:=2}"
+: "${S3_VAL_RATIO:=0.02}"
+: "${S3_PATIENCE:=12}"
+: "${S3_MIN_DELTA:=0.0003}"
+: "${S3_LR:=1e-5}"
+: "${S3_MAX_STEPS:=40000}"
+
+: "${S2B_R2_GRAPH_QA_MAX_PER_IMAGE:=8}"
+: "${S2B_R2_GRAPH_QA_REPEAT:=7}"
+: "${S2B_R2_VAL_RATIO:=0.02}"
+: "${S2B_R2_PATIENCE:=22}"
+: "${S2B_R2_MIN_DELTA:=0.0002}"
+: "${S2B_R2_LR:=7e-6}"
+: "${S2B_R2_MAX_STEPS:=120000}"
+
+: "${S3_R2_GRAPH_QA_MAX_PER_IMAGE:=5}"
+: "${S3_R2_GRAPH_QA_REPEAT:=3}"
+: "${S3_R2_VAL_RATIO:=0.02}"
+: "${S3_R2_PATIENCE:=16}"
+: "${S3_R2_MIN_DELTA:=0.0002}"
+: "${S3_R2_LR:=8e-6}"
+: "${S3_R2_MAX_STEPS:=50000}"
 
 VG_SCENE_GRAPHS=${VG_SCENE_GRAPHS:-"$REPO/data/vg/contents/sceneGraphs/scene_graphs.json"}
 VG_REGIONS=${VG_REGIONS:-"$REPO/data/vg/contents/regionDescriptions/region_descriptions.json"}
@@ -205,6 +291,10 @@ GQA_PRED_R2=${GQA_PRED_R2:-"$REPO/data/gqa/pred_val_balanced_round2.jsonl"}
 GQA_EVAL_R2=${GQA_EVAL_R2:-"$REPO/data/gqa/eval_val_balanced_round2.txt"}
 
 SELECT_CKPT="${REPO}/scripts/train/select_best_ckpt.py"
+STAGE2A_CKPT=${STAGE2A_CKPT:-}
+STAGE2B_CKPT=${STAGE2B_CKPT:-}
+STAGE3_STATE_DICT=${STAGE3_STATE_DICT:-"$STAGE3_DIR/omnigraph_stage3_state_dict.pt"}
+STAGE3_R2_STATE_DICT=${STAGE3_R2_STATE_DICT:-"$STAGE3_R2_DIR/omnigraph_stage3_state_dict.pt"}
 
 echo "[Precheck] repo=${REPO}"
 echo "[Precheck] GPU request=${ORIG_GPU} isolate=${ISOLATE_GPU} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset} internal_gpu=${GPU}"
@@ -371,7 +461,38 @@ run_with_auto_batch_retry() {
   done
 }
 
+resolve_stage2a_ckpt() {
+  local ckpt="${STAGE2A_CKPT:-}"
+  if [ -z "$ckpt" ]; then
+    ckpt=$("$PYTHON_BIN" "$SELECT_CKPT" \
+      --meta "$STAGE2A_DIR/stage2A_meta.json" \
+      --fallback "$STAGE2A_DIR/last.ckpt")
+  fi
+  if [ ! -f "$ckpt" ]; then
+    echo "[Stage2A] checkpoint not found: $ckpt"
+    exit 1
+  fi
+  STAGE2A_CKPT="$ckpt"
+  echo "[Stage2A] using ckpt: $STAGE2A_CKPT"
+}
+
+resolve_stage2b_ckpt() {
+  local ckpt="${STAGE2B_CKPT:-}"
+  if [ -z "$ckpt" ]; then
+    ckpt=$("$PYTHON_BIN" "$SELECT_CKPT" \
+      --meta "$STAGE2B_DIR/stage2B_meta.json" \
+      --fallback "$STAGE2B_DIR/last.ckpt")
+  fi
+  if [ ! -f "$ckpt" ]; then
+    echo "[Stage2B] checkpoint not found: $ckpt"
+    exit 1
+  fi
+  STAGE2B_CKPT="$ckpt"
+  echo "[Stage2B] using ckpt: $STAGE2B_CKPT"
+}
+
 echo "[Config] LOW_VRAM_4090=${LOW_VRAM_4090} LLM_MODEL=${LLM_MODEL} VISION_MODEL=${VISION_MODEL}"
+echo "[Config] PIPELINE_MODE=${PIPELINE_MODE} run_stage2a=${RUN_STAGE2A} run_stage2b=${RUN_STAGE2B} run_stage3=${RUN_STAGE3} run_eval=${RUN_EVAL}"
 echo "[Config] AUTO_BATCH_BY_VRAM=${AUTO_BATCH_BY_VRAM} detected_vram_gb=${GPU_VRAM_GB}"
 echo "[Config] AUTO_BATCH_RETRY_ON_OOM=${AUTO_BATCH_RETRY_ON_OOM} AUTO_BATCH_MAX_RETRIES=${AUTO_BATCH_MAX_RETRIES}"
 echo "[Config] AUTO_BATCH_SCALE=${AUTO_BATCH_SCALE} MAX_AUTO_BATCH=${MAX_AUTO_BATCH:-64}"
@@ -384,136 +505,181 @@ if [ "$AUTO_BATCH_BY_VRAM" = "1" ]; then
 fi
 echo "[Config] LLM_DTYPE=${LLM_DTYPE} LLM_ATTN_IMPL=${LLM_ATTN_IMPL}"
 echo "[Config] NODE_ENCODER_TYPE=${NODE_ENCODER_TYPE} ALPHA=${NODE_ENCODER_ALPHA_INIT} OUT_DIM=${NODE_ENCODER_OUT_DIM}"
+echo "[Config] QA_TYPE_TOKEN=${USE_QA_TYPE_TOKEN} GVL_ADAPTER=${ENABLE_GVL_ADAPTER} GVL_GATE=${GVL_ADAPTER_GATE_INIT} AUX_HEAD=${ENABLE_GRAPH_AUX_HEAD}"
+echo "[Config] AUX_W: S2A=${S2A_GRAPH_AUX_LOSS_WEIGHT} S2B=${S2B_GRAPH_AUX_LOSS_WEIGHT} S3=${S3_GRAPH_AUX_LOSS_WEIGHT} S2B_R2=${S2B_R2_GRAPH_AUX_LOSS_WEIGHT} S3_R2=${S3_R2_GRAPH_AUX_LOSS_WEIGHT}"
+echo "[Config] ALIGN: ENABLE_XTC=${ENABLE_XTC} ENABLE_XTM=${ENABLE_XTM} SCALE_INIT=${XTC_LOGIT_SCALE_INIT} DUP_THRESH=${XTM_DUP_THRESH}"
+echo "[Config] XTC/XTM W: S2A=${S2A_XTC_WEIGHT}/${S2A_XTM_WEIGHT} S2B=${S2B_XTC_WEIGHT}/${S2B_XTM_WEIGHT} S3=${S3_XTC_WEIGHT}/${S3_XTM_WEIGHT} S2B_R2=${S2B_R2_XTC_WEIGHT}/${S2B_R2_XTM_WEIGHT} S3_R2=${S3_R2_XTC_WEIGHT}/${S3_R2_XTM_WEIGHT}"
 echo "[Config] S2A bs=${S2A_BATCH_SIZE} max_len=${S2A_MAX_LENGTH} workers=${S2A_NUM_WORKERS} prec=${S2A_PRECISION}"
 echo "[Config] S2B bs=${S2B_BATCH_SIZE} max_len=${S2B_MAX_LENGTH} workers=${S2B_NUM_WORKERS} prec=${S2B_PRECISION}"
 echo "[Config] S3  bs=${S3_BATCH_SIZE} max_len=${S3_MAX_LENGTH} workers=${S3_NUM_WORKERS} prec=${S3_PRECISION}"
 echo "[Config] val: S2A(interval=${S2A_VAL_CHECK_INTERVAL},limit=${S2A_LIMIT_VAL_BATCHES}) S2B(interval=${S2B_VAL_CHECK_INTERVAL},limit=${S2B_LIMIT_VAL_BATCHES}) S3(interval=${S3_VAL_CHECK_INTERVAL},limit=${S3_LIMIT_VAL_BATCHES})"
-echo "[Config] freeze_vg_adapter: S2A=${S2A_FREEZE_VG_ADAPTER} S2B=${S2B_FREEZE_VG_ADAPTER} S2B_R2=${S2B_R2_FREEZE_VG_ADAPTER}"
 echo "[Config] train_node_encoder: S2A=${S2A_TRAIN_NODE_ENCODER} S2B=${S2B_TRAIN_NODE_ENCODER} S3=${S3_TRAIN_NODE_ENCODER} S2B_R2=${S2B_R2_TRAIN_NODE_ENCODER} S3_R2=${S3_R2_TRAIN_NODE_ENCODER}"
-test -f "$STAGE1_QFORMER_CKPT"
-test -f "$VG_SCENE_GRAPHS"
-test -f "$VG_REGIONS"
-test -f "$GQA_QUESTIONS_JSON"
-test -f "$GQA_SCENE_RAW"
-test -f "$SELECT_CKPT"
-
-echo "[Stage2A] start"
-S2A_EXTRA_ARGS=()
-if [ "$S2A_FREEZE_VG_ADAPTER" = "1" ]; then
-  S2A_EXTRA_ARGS+=(--freeze_vg_adapter)
+if [ "$RUN_STAGE2A" = "1" ]; then
+  test -f "$STAGE1_QFORMER_CKPT"
 fi
-S2A_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_projector.py" \
-  --scene_graphs "$VG_SCENE_GRAPHS" \
-  --regions "$VG_REGIONS" \
-  --stage1_qformer_ckpt "$STAGE1_QFORMER_CKPT" \
-  --llm "$LLM_MODEL" \
-  --llm_dtype "$LLM_DTYPE" \
-  --llm_attn_implementation "$LLM_ATTN_IMPL" \
-  --node_encoder_type "$NODE_ENCODER_TYPE" \
-  --node_encoder_alpha_init "$NODE_ENCODER_ALPHA_INIT" \
-  --node_encoder_out_dim "$NODE_ENCODER_OUT_DIM" \
-  --train_node_encoder "$S2A_TRAIN_NODE_ENCODER" \
-  --graph_qa_max_per_image 5 \
-  --graph_qa_repeat 3 \
-  --gpu "$GPU" \
-  --precision "$S2A_PRECISION" \
-  --max_length "$S2A_MAX_LENGTH" \
-  --max_graph_tokens "$S2A_MAX_GRAPH_TOKENS" \
-  --num_workers "$S2A_NUM_WORKERS" \
-  --num_sanity_val_steps "$S2A_NUM_SANITY_VAL_STEPS" \
-  --accumulate_grad_batches "$S2A_ACCUM_GRAD_BATCHES" \
-  --val_ratio 0.02 \
-  --patience 16 \
-  --min_delta 0.0005 \
-  --lr 3e-5 \
-  --max_steps 120000 \
-  --val_check_interval "$S2A_VAL_CHECK_INTERVAL" \
-  --limit_val_batches "$S2A_LIMIT_VAL_BATCHES" \
-  "${S2A_EXTRA_ARGS[@]}" \
-  --save_dir "$STAGE2A_DIR")
-run_with_auto_batch_retry "Stage2A" "S2A_BATCH_SIZE" "${S2A_CMD[@]}"
-
-STAGE2A_CKPT=$("$PYTHON_BIN" "$SELECT_CKPT" \
-  --meta "$STAGE2A_DIR/stage2A_meta.json" \
-  --fallback "$STAGE2A_DIR/last.ckpt")
-echo "[Stage2A] using ckpt: $STAGE2A_CKPT"
-test -f "$STAGE2A_CKPT"
-
-echo "[Stage2B] start"
-S2B_EXTRA_ARGS=()
-if [ "$S2B_FREEZE_VG_ADAPTER" = "1" ]; then
-  S2B_EXTRA_ARGS+=(--freeze_vg_adapter)
+if [ "$RUN_STAGE2A" = "1" ] || [ "$RUN_STAGE2B" = "1" ] || [ "$RUN_STAGE3" = "1" ]; then
+  test -f "$VG_SCENE_GRAPHS"
+  test -f "$VG_REGIONS"
+  test -f "$SELECT_CKPT"
 fi
-S2B_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_stage2B.py" \
-  --scene_graphs "$VG_SCENE_GRAPHS" \
-  --regions "$VG_REGIONS" \
-  --stage2A_ckpt "$STAGE2A_CKPT" \
-  --llm "$LLM_MODEL" \
-  --llm_dtype "$LLM_DTYPE" \
-  --llm_attn_implementation "$LLM_ATTN_IMPL" \
-  --node_encoder_type "$NODE_ENCODER_TYPE" \
-  --node_encoder_alpha_init "$NODE_ENCODER_ALPHA_INIT" \
-  --node_encoder_out_dim "$NODE_ENCODER_OUT_DIM" \
-  --train_node_encoder "$S2B_TRAIN_NODE_ENCODER" \
-  --graph_qa_max_per_image 6 \
-  --graph_qa_repeat 4 \
-  --gpu "$GPU" \
-  --precision "$S2B_PRECISION" \
-  --max_length "$S2B_MAX_LENGTH" \
-  --max_graph_tokens "$S2B_MAX_GRAPH_TOKENS" \
-  --num_workers "$S2B_NUM_WORKERS" \
-  --num_sanity_val_steps "$S2B_NUM_SANITY_VAL_STEPS" \
-  --accumulate_grad_batches "$S2B_ACCUM_GRAD_BATCHES" \
-  --lr 1.2e-5 \
-  --max_steps 60000 \
-  --val_ratio 0.02 \
-  --val_check_interval "$S2B_VAL_CHECK_INTERVAL" \
-  --limit_val_batches "$S2B_LIMIT_VAL_BATCHES" \
-  --patience 16 \
-  --min_delta 0.0005 \
-  "${S2B_EXTRA_ARGS[@]}" \
-  --save_dir "$STAGE2B_DIR")
-run_with_auto_batch_retry "Stage2B" "S2B_BATCH_SIZE" "${S2B_CMD[@]}"
+if [ "$RUN_STAGE3" = "1" ]; then
+  test -d "$VG_IMAGE_ROOT" || true
+fi
+if [ "$RUN_EVAL" = "1" ]; then
+  test -f "$GQA_QUESTIONS_JSON"
+  test -f "$GQA_SCENE_RAW"
+fi
 
-STAGE2B_CKPT=$("$PYTHON_BIN" "$SELECT_CKPT" \
-  --meta "$STAGE2B_DIR/stage2B_meta.json" \
-  --fallback "$STAGE2B_DIR/last.ckpt")
-echo "[Stage2B] using ckpt: $STAGE2B_CKPT"
-test -f "$STAGE2B_CKPT"
+if [ "$RUN_STAGE2A" = "1" ]; then
+  echo "[Stage2A] start"
+  S2A_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_projector.py" \
+    --scene_graphs "$VG_SCENE_GRAPHS" \
+    --regions "$VG_REGIONS" \
+    --stage1_qformer_ckpt "$STAGE1_QFORMER_CKPT" \
+    --llm "$LLM_MODEL" \
+    --llm_dtype "$LLM_DTYPE" \
+    --llm_attn_implementation "$LLM_ATTN_IMPL" \
+    --node_encoder_type "$NODE_ENCODER_TYPE" \
+    --node_encoder_alpha_init "$NODE_ENCODER_ALPHA_INIT" \
+    --node_encoder_out_dim "$NODE_ENCODER_OUT_DIM" \
+    --use_qa_type_token "$USE_QA_TYPE_TOKEN" \
+    --enable_gvl_adapter "$ENABLE_GVL_ADAPTER" \
+    --gvl_adapter_gate_init "$GVL_ADAPTER_GATE_INIT" \
+    --enable_graph_aux_head "$ENABLE_GRAPH_AUX_HEAD" \
+    --graph_aux_loss_weight "$S2A_GRAPH_AUX_LOSS_WEIGHT" \
+    --enable_xtc "$ENABLE_XTC" \
+    --enable_xtm "$ENABLE_XTM" \
+    --xtc_weight "$S2A_XTC_WEIGHT" \
+    --xtm_weight "$S2A_XTM_WEIGHT" \
+    --xtc_logit_scale_init "$XTC_LOGIT_SCALE_INIT" \
+    --xtm_dup_thresh "$XTM_DUP_THRESH" \
+    --train_node_encoder "$S2A_TRAIN_NODE_ENCODER" \
+    --graph_qa_max_per_image "$S2A_GRAPH_QA_MAX_PER_IMAGE" \
+    --graph_qa_repeat "$S2A_GRAPH_QA_REPEAT" \
+    --gpu "$GPU" \
+    --precision "$S2A_PRECISION" \
+    --max_length "$S2A_MAX_LENGTH" \
+    --max_graph_tokens "$S2A_MAX_GRAPH_TOKENS" \
+    --num_workers "$S2A_NUM_WORKERS" \
+    --num_sanity_val_steps "$S2A_NUM_SANITY_VAL_STEPS" \
+    --accumulate_grad_batches "$S2A_ACCUM_GRAD_BATCHES" \
+    --val_ratio "$S2A_VAL_RATIO" \
+    --patience "$S2A_PATIENCE" \
+    --min_delta "$S2A_MIN_DELTA" \
+    --lr "$S2A_LR" \
+    --max_steps "$S2A_MAX_STEPS" \
+    --val_check_interval "$S2A_VAL_CHECK_INTERVAL" \
+    --limit_val_batches "$S2A_LIMIT_VAL_BATCHES" \
+    --save_dir "$STAGE2A_DIR")
+  run_with_auto_batch_retry "Stage2A" "S2A_BATCH_SIZE" "${S2A_CMD[@]}"
+  resolve_stage2a_ckpt
+elif [ "$RUN_STAGE2B" = "1" ]; then
+  resolve_stage2a_ckpt
+fi
 
-echo "[Stage3] start"
-S3_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_stage3.py" \
-  --scene_graphs "$VG_SCENE_GRAPHS" \
-  --regions "$VG_REGIONS" \
-  --image_root "$VG_IMAGE_ROOT" \
-  --stage2B_ckpt "$STAGE2B_CKPT" \
-  --llm "$LLM_MODEL" \
-  --llm_dtype "$LLM_DTYPE" \
-  --llm_attn_implementation "$LLM_ATTN_IMPL" \
-  --node_encoder_type "$NODE_ENCODER_TYPE" \
-  --node_encoder_alpha_init "$NODE_ENCODER_ALPHA_INIT" \
-  --node_encoder_out_dim "$NODE_ENCODER_OUT_DIM" \
-  --train_node_encoder "$S3_TRAIN_NODE_ENCODER" \
-  --vision "$VISION_MODEL" \
-  --graph_qa_max_per_image 4 \
-  --graph_qa_repeat 2 \
-  --gpu "$GPU" \
-  --precision "$S3_PRECISION" \
-  --max_length "$S3_MAX_LENGTH" \
-  --max_graph_tokens "$S3_MAX_GRAPH_TOKENS" \
-  --max_vision_tokens "$S3_MAX_VISION_TOKENS" \
-  --num_workers "$S3_NUM_WORKERS" \
-  --num_sanity_val_steps "$S3_NUM_SANITY_VAL_STEPS" \
-  --accumulate_grad_batches "$S3_ACCUM_GRAD_BATCHES" \
-  --lr 2e-5 \
-  --max_steps 50000 \
-  --val_ratio 0.02 \
-  --val_check_interval "$S3_VAL_CHECK_INTERVAL" \
-  --limit_val_batches "$S3_LIMIT_VAL_BATCHES" \
-  --patience 14 \
-  --min_delta 0.0005 \
-  --save_dir "$STAGE3_DIR")
-run_with_auto_batch_retry "Stage3" "S3_BATCH_SIZE" "${S3_CMD[@]}"
+if [ "$RUN_STAGE2B" = "1" ]; then
+  echo "[Stage2B] start"
+  S2B_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_stage2B.py" \
+    --scene_graphs "$VG_SCENE_GRAPHS" \
+    --regions "$VG_REGIONS" \
+    --stage2A_ckpt "$STAGE2A_CKPT" \
+    --llm "$LLM_MODEL" \
+    --llm_dtype "$LLM_DTYPE" \
+    --llm_attn_implementation "$LLM_ATTN_IMPL" \
+    --node_encoder_type "$NODE_ENCODER_TYPE" \
+    --node_encoder_alpha_init "$NODE_ENCODER_ALPHA_INIT" \
+    --node_encoder_out_dim "$NODE_ENCODER_OUT_DIM" \
+    --use_qa_type_token "$USE_QA_TYPE_TOKEN" \
+    --enable_gvl_adapter "$ENABLE_GVL_ADAPTER" \
+    --gvl_adapter_gate_init "$GVL_ADAPTER_GATE_INIT" \
+    --enable_graph_aux_head "$ENABLE_GRAPH_AUX_HEAD" \
+    --graph_aux_loss_weight "$S2B_GRAPH_AUX_LOSS_WEIGHT" \
+    --enable_xtc "$ENABLE_XTC" \
+    --enable_xtm "$ENABLE_XTM" \
+    --xtc_weight "$S2B_XTC_WEIGHT" \
+    --xtm_weight "$S2B_XTM_WEIGHT" \
+    --xtc_logit_scale_init "$XTC_LOGIT_SCALE_INIT" \
+    --xtm_dup_thresh "$XTM_DUP_THRESH" \
+    --train_node_encoder "$S2B_TRAIN_NODE_ENCODER" \
+    --graph_qa_max_per_image "$S2B_GRAPH_QA_MAX_PER_IMAGE" \
+    --graph_qa_repeat "$S2B_GRAPH_QA_REPEAT" \
+    --gpu "$GPU" \
+    --precision "$S2B_PRECISION" \
+    --max_length "$S2B_MAX_LENGTH" \
+    --max_graph_tokens "$S2B_MAX_GRAPH_TOKENS" \
+    --num_workers "$S2B_NUM_WORKERS" \
+    --num_sanity_val_steps "$S2B_NUM_SANITY_VAL_STEPS" \
+    --accumulate_grad_batches "$S2B_ACCUM_GRAD_BATCHES" \
+    --lr "$S2B_LR" \
+    --max_steps "$S2B_MAX_STEPS" \
+    --val_ratio "$S2B_VAL_RATIO" \
+    --val_check_interval "$S2B_VAL_CHECK_INTERVAL" \
+    --limit_val_batches "$S2B_LIMIT_VAL_BATCHES" \
+    --patience "$S2B_PATIENCE" \
+    --min_delta "$S2B_MIN_DELTA" \
+    --save_dir "$STAGE2B_DIR")
+  run_with_auto_batch_retry "Stage2B" "S2B_BATCH_SIZE" "${S2B_CMD[@]}"
+  resolve_stage2b_ckpt
+elif [ "$RUN_STAGE3" = "1" ]; then
+  resolve_stage2b_ckpt
+fi
+
+if [ "$RUN_STAGE3" = "1" ]; then
+  echo "[Stage3] start"
+  S3_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_stage3.py" \
+    --scene_graphs "$VG_SCENE_GRAPHS" \
+    --regions "$VG_REGIONS" \
+    --image_root "$VG_IMAGE_ROOT" \
+    --stage2B_ckpt "$STAGE2B_CKPT" \
+    --llm "$LLM_MODEL" \
+    --llm_dtype "$LLM_DTYPE" \
+    --llm_attn_implementation "$LLM_ATTN_IMPL" \
+    --node_encoder_type "$NODE_ENCODER_TYPE" \
+    --node_encoder_alpha_init "$NODE_ENCODER_ALPHA_INIT" \
+    --node_encoder_out_dim "$NODE_ENCODER_OUT_DIM" \
+    --use_qa_type_token "$USE_QA_TYPE_TOKEN" \
+    --enable_gvl_adapter "$ENABLE_GVL_ADAPTER" \
+    --gvl_adapter_gate_init "$GVL_ADAPTER_GATE_INIT" \
+    --enable_graph_aux_head "$ENABLE_GRAPH_AUX_HEAD" \
+    --graph_aux_loss_weight "$S3_GRAPH_AUX_LOSS_WEIGHT" \
+    --enable_xtc "$ENABLE_XTC" \
+    --enable_xtm "$ENABLE_XTM" \
+    --xtc_weight "$S3_XTC_WEIGHT" \
+    --xtm_weight "$S3_XTM_WEIGHT" \
+    --xtc_logit_scale_init "$XTC_LOGIT_SCALE_INIT" \
+    --xtm_dup_thresh "$XTM_DUP_THRESH" \
+    --train_node_encoder "$S3_TRAIN_NODE_ENCODER" \
+    --vision "$VISION_MODEL" \
+    --graph_qa_max_per_image "$S3_GRAPH_QA_MAX_PER_IMAGE" \
+    --graph_qa_repeat "$S3_GRAPH_QA_REPEAT" \
+    --gpu "$GPU" \
+    --precision "$S3_PRECISION" \
+    --max_length "$S3_MAX_LENGTH" \
+    --max_graph_tokens "$S3_MAX_GRAPH_TOKENS" \
+    --max_vision_tokens "$S3_MAX_VISION_TOKENS" \
+    --num_workers "$S3_NUM_WORKERS" \
+    --num_sanity_val_steps "$S3_NUM_SANITY_VAL_STEPS" \
+    --accumulate_grad_batches "$S3_ACCUM_GRAD_BATCHES" \
+    --lr "$S3_LR" \
+    --max_steps "$S3_MAX_STEPS" \
+    --val_ratio "$S3_VAL_RATIO" \
+    --val_check_interval "$S3_VAL_CHECK_INTERVAL" \
+    --limit_val_batches "$S3_LIMIT_VAL_BATCHES" \
+    --patience "$S3_PATIENCE" \
+    --min_delta "$S3_MIN_DELTA" \
+    --save_dir "$STAGE3_DIR")
+  run_with_auto_batch_retry "Stage3" "S3_BATCH_SIZE" "${S3_CMD[@]}"
+fi
+
+if [ "$RUN_EVAL" != "1" ]; then
+  echo "[Done] mode=${PIPELINE_MODE} completed (training-only)."
+  exit 0
+fi
+
+if [ ! -f "$STAGE3_STATE_DICT" ]; then
+  echo "[GQA] stage3 state_dict not found: $STAGE3_STATE_DICT"
+  exit 1
+fi
 
 echo "[GQA] prepare converted files"
 if [ ! -f "$GQA_SCENE_VG" ]; then
@@ -534,7 +700,7 @@ echo "[GQA] infer paper run"
   --questions "$GQA_QUESTIONS_JSONL" \
   --scene_graphs "$GQA_SCENE_VG" \
   --image_root "$GQA_IMAGE_ROOT" \
-  --ckpt "$STAGE3_DIR/omnigraph_stage3_state_dict.pt" \
+  --ckpt "$STAGE3_STATE_DICT" \
   --llm "$LLM_MODEL" \
   --vision "$VISION_MODEL" \
   --node_encoder_type "$NODE_ENCODER_TYPE" \
@@ -640,10 +806,6 @@ if [ "$RUN_R2" != "1" ]; then
 fi
 
 echo "[Round2] strict/query below target, start fixed round-2 recipe."
-S2B_R2_EXTRA_ARGS=()
-if [ "$S2B_R2_FREEZE_VG_ADAPTER" = "1" ]; then
-  S2B_R2_EXTRA_ARGS+=(--freeze_vg_adapter)
-fi
 S2B_R2_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_stage2B.py" \
   --scene_graphs "$VG_SCENE_GRAPHS" \
   --regions "$VG_REGIONS" \
@@ -654,9 +816,20 @@ S2B_R2_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_stage2B.py" \
   --node_encoder_type "$NODE_ENCODER_TYPE" \
   --node_encoder_alpha_init "$NODE_ENCODER_ALPHA_INIT" \
   --node_encoder_out_dim "$NODE_ENCODER_OUT_DIM" \
+  --use_qa_type_token "$USE_QA_TYPE_TOKEN" \
+  --enable_gvl_adapter "$ENABLE_GVL_ADAPTER" \
+  --gvl_adapter_gate_init "$GVL_ADAPTER_GATE_INIT" \
+  --enable_graph_aux_head "$ENABLE_GRAPH_AUX_HEAD" \
+  --graph_aux_loss_weight "$S2B_R2_GRAPH_AUX_LOSS_WEIGHT" \
+  --enable_xtc "$ENABLE_XTC" \
+  --enable_xtm "$ENABLE_XTM" \
+  --xtc_weight "$S2B_R2_XTC_WEIGHT" \
+  --xtm_weight "$S2B_R2_XTM_WEIGHT" \
+  --xtc_logit_scale_init "$XTC_LOGIT_SCALE_INIT" \
+  --xtm_dup_thresh "$XTM_DUP_THRESH" \
   --train_node_encoder "$S2B_R2_TRAIN_NODE_ENCODER" \
-  --graph_qa_max_per_image 8 \
-  --graph_qa_repeat 5 \
+  --graph_qa_max_per_image "$S2B_R2_GRAPH_QA_MAX_PER_IMAGE" \
+  --graph_qa_repeat "$S2B_R2_GRAPH_QA_REPEAT" \
   --gpu "$GPU" \
   --precision "$S2B_R2_PRECISION" \
   --max_length "$S2B_R2_MAX_LENGTH" \
@@ -664,14 +837,13 @@ S2B_R2_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_stage2B.py" \
   --num_workers "$S2B_R2_NUM_WORKERS" \
   --num_sanity_val_steps "$S2B_R2_NUM_SANITY_VAL_STEPS" \
   --accumulate_grad_batches "$S2B_R2_ACCUM_GRAD_BATCHES" \
-  --lr 8e-6 \
-  --max_steps 80000 \
-  --val_ratio 0.02 \
+  --lr "$S2B_R2_LR" \
+  --max_steps "$S2B_R2_MAX_STEPS" \
+  --val_ratio "$S2B_R2_VAL_RATIO" \
   --val_check_interval "$S2B_R2_VAL_CHECK_INTERVAL" \
   --limit_val_batches "$S2B_R2_LIMIT_VAL_BATCHES" \
-  --patience 20 \
-  --min_delta 0.0003 \
-  "${S2B_R2_EXTRA_ARGS[@]}" \
+  --patience "$S2B_R2_PATIENCE" \
+  --min_delta "$S2B_R2_MIN_DELTA" \
   --save_dir "$STAGE2B_R2_DIR")
 run_with_auto_batch_retry "Stage2B-R2" "S2B_R2_BATCH_SIZE" "${S2B_R2_CMD[@]}"
 
@@ -692,10 +864,21 @@ S3_R2_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_stage3.py" \
   --node_encoder_type "$NODE_ENCODER_TYPE" \
   --node_encoder_alpha_init "$NODE_ENCODER_ALPHA_INIT" \
   --node_encoder_out_dim "$NODE_ENCODER_OUT_DIM" \
+  --use_qa_type_token "$USE_QA_TYPE_TOKEN" \
+  --enable_gvl_adapter "$ENABLE_GVL_ADAPTER" \
+  --gvl_adapter_gate_init "$GVL_ADAPTER_GATE_INIT" \
+  --enable_graph_aux_head "$ENABLE_GRAPH_AUX_HEAD" \
+  --graph_aux_loss_weight "$S3_R2_GRAPH_AUX_LOSS_WEIGHT" \
+  --enable_xtc "$ENABLE_XTC" \
+  --enable_xtm "$ENABLE_XTM" \
+  --xtc_weight "$S3_R2_XTC_WEIGHT" \
+  --xtm_weight "$S3_R2_XTM_WEIGHT" \
+  --xtc_logit_scale_init "$XTC_LOGIT_SCALE_INIT" \
+  --xtm_dup_thresh "$XTM_DUP_THRESH" \
   --train_node_encoder "$S3_R2_TRAIN_NODE_ENCODER" \
   --vision "$VISION_MODEL" \
-  --graph_qa_max_per_image 5 \
-  --graph_qa_repeat 3 \
+  --graph_qa_max_per_image "$S3_R2_GRAPH_QA_MAX_PER_IMAGE" \
+  --graph_qa_repeat "$S3_R2_GRAPH_QA_REPEAT" \
   --gpu "$GPU" \
   --precision "$S3_R2_PRECISION" \
   --max_length "$S3_R2_MAX_LENGTH" \
@@ -704,13 +887,13 @@ S3_R2_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_stage3.py" \
   --num_workers "$S3_R2_NUM_WORKERS" \
   --num_sanity_val_steps "$S3_R2_NUM_SANITY_VAL_STEPS" \
   --accumulate_grad_batches "$S3_R2_ACCUM_GRAD_BATCHES" \
-  --lr 1.5e-5 \
-  --max_steps 70000 \
-  --val_ratio 0.02 \
+  --lr "$S3_R2_LR" \
+  --max_steps "$S3_R2_MAX_STEPS" \
+  --val_ratio "$S3_R2_VAL_RATIO" \
   --val_check_interval "$S3_R2_VAL_CHECK_INTERVAL" \
   --limit_val_batches "$S3_R2_LIMIT_VAL_BATCHES" \
-  --patience 18 \
-  --min_delta 0.0003 \
+  --patience "$S3_R2_PATIENCE" \
+  --min_delta "$S3_R2_MIN_DELTA" \
   --save_dir "$STAGE3_R2_DIR")
 run_with_auto_batch_retry "Stage3-R2" "S3_R2_BATCH_SIZE" "${S3_R2_CMD[@]}"
 
@@ -718,7 +901,7 @@ run_with_auto_batch_retry "Stage3-R2" "S3_R2_BATCH_SIZE" "${S3_R2_CMD[@]}"
   --questions "$GQA_QUESTIONS_JSONL" \
   --scene_graphs "$GQA_SCENE_VG" \
   --image_root "$GQA_IMAGE_ROOT" \
-  --ckpt "$STAGE3_R2_DIR/omnigraph_stage3_state_dict.pt" \
+  --ckpt "$STAGE3_R2_STATE_DICT" \
   --llm "$LLM_MODEL" \
   --vision "$VISION_MODEL" \
   --node_encoder_type "$NODE_ENCODER_TYPE" \

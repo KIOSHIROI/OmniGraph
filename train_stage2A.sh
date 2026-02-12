@@ -1,34 +1,38 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Stage2A paper-sprint profile (VG-only, stronger GQA-like transfer)
-
 WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$WORKDIR"
 
-PYTHON_BIN=${PYTHON_BIN:-python}
-GPU=${GPU:-0}
+map_var() {
+  local old_name="$1"
+  local new_name="$2"
+  if [ -n "${!old_name+x}" ] && [ -z "${!new_name+x}" ]; then
+    export "$new_name=${!old_name}"
+  fi
+}
 
-SCENE_GRAPHS=${SCENE_GRAPHS:-data/vg/contents/sceneGraphs/scene_graphs.json}
-REGIONS=${REGIONS:-data/vg/contents/regionDescriptions/region_descriptions.json}
-STAGE1_CKPT=${STAGE1_CKPT:-graph_qformer_stage1.pt}
-SAVE_DIR=${SAVE_DIR:-checkpoints_projector_vg/stage2A_paper}
+map_var SCENE_GRAPHS VG_SCENE_GRAPHS
+map_var REGIONS VG_REGIONS
+map_var STAGE1_CKPT STAGE1_QFORMER_CKPT
+map_var SAVE_DIR STAGE2A_DIR
+map_var BATCH_SIZE S2A_BATCH_SIZE
+map_var PRECISION S2A_PRECISION
+map_var MAX_LENGTH S2A_MAX_LENGTH
+map_var MAX_GRAPH_TOKENS S2A_MAX_GRAPH_TOKENS
+map_var NUM_WORKERS S2A_NUM_WORKERS
+map_var ACCUM_GRAD_BATCHES S2A_ACCUM_GRAD_BATCHES
+map_var VAL_CHECK_INTERVAL S2A_VAL_CHECK_INTERVAL
+map_var VAL_RATIO S2A_VAL_RATIO
+map_var PATIENCE S2A_PATIENCE
+map_var MIN_DELTA S2A_MIN_DELTA
+map_var LR S2A_LR
+map_var MAX_STEPS S2A_MAX_STEPS
+map_var GRAPH_QA_MAX_PER_IMAGE S2A_GRAPH_QA_MAX_PER_IMAGE
+map_var GRAPH_QA_REPEAT S2A_GRAPH_QA_REPEAT
+map_var GRAPH_AUX_LOSS_WEIGHT S2A_GRAPH_AUX_LOSS_WEIGHT
+map_var XTC_WEIGHT S2A_XTC_WEIGHT
+map_var XTM_WEIGHT S2A_XTM_WEIGHT
 
-"$PYTHON_BIN" omnigraph/train/train_projector.py \
-  --scene_graphs "$SCENE_GRAPHS" \
-  --regions "$REGIONS" \
-  --stage1_qformer_ckpt "$STAGE1_CKPT" \
-  --graph_qa_max_per_image 5 \
-  --graph_qa_repeat 3 \
-  --gpu "$GPU" \
-  --batch_size 1 \
-  --precision 16 \
-  --max_length 256 \
-  --num_workers 0 \
-  --val_ratio 0.02 \
-  --patience 16 \
-  --min_delta 0.0005 \
-  --lr 3e-5 \
-  --max_steps 120000 \
-  --val_check_interval 1000 \
-  --save_dir "$SAVE_DIR"
+export PIPELINE_MODE=stage2a
+exec bash "$WORKDIR/scripts/train/run_4090_gqa_sprint.sh"

@@ -296,6 +296,8 @@ def main() -> int:
     ap.add_argument("--node_encoder_type", default="auto", choices=["auto", "hybrid", "open_vocab", "legacy_vg"])
     ap.add_argument("--node_encoder_alpha_init", type=float, default=-1.0, help="<0 means read from stage3_meta or fallback.")
     ap.add_argument("--node_encoder_out_dim", type=int, default=0, help="<=0 means read from stage3_meta or fallback 128.")
+    ap.add_argument("--enable_gvl_adapter", type=int, default=-1, choices=[-1, 0, 1], help="-1 means read from stage3_meta or fallback.")
+    ap.add_argument("--gvl_adapter_gate_init", type=float, default=-1.0, help="<0 means read from stage3_meta or fallback.")
     ap.add_argument("--batch_size", type=int, default=1)
     ap.add_argument("--max_length", type=int, default=128)
     ap.add_argument("--max_new_tokens", type=int, default=12)
@@ -319,6 +321,7 @@ def main() -> int:
 
     stage3_meta = _load_stage3_meta(args.ckpt)
     stage3_node_cfg = stage3_meta.get("node_encoder_config", {}) if isinstance(stage3_meta, dict) else {}
+    stage3_arch_cfg = stage3_meta.get("architecture_config", {}) if isinstance(stage3_meta, dict) else {}
     resolved_node_encoder_type = (
         str(stage3_node_cfg.get("type", "hybrid"))
         if str(args.node_encoder_type).strip().lower() == "auto"
@@ -334,10 +337,21 @@ def main() -> int:
         if int(args.node_encoder_out_dim) <= 0
         else int(args.node_encoder_out_dim)
     )
+    resolved_enable_gvl_adapter = (
+        bool(stage3_arch_cfg.get("enable_gvl_adapter", True))
+        if int(args.enable_gvl_adapter) < 0
+        else bool(int(args.enable_gvl_adapter))
+    )
+    resolved_gvl_adapter_gate_init = (
+        float(stage3_arch_cfg.get("gvl_adapter_gate_init", 0.1))
+        if float(args.gvl_adapter_gate_init) < 0
+        else float(args.gvl_adapter_gate_init)
+    )
     print(
         "[Config] "
         f"llm={args.llm} vision={args.vision} node_encoder={resolved_node_encoder_type} "
-        f"alpha_init={resolved_node_encoder_alpha} out_dim={resolved_node_encoder_out_dim}"
+        f"alpha_init={resolved_node_encoder_alpha} out_dim={resolved_node_encoder_out_dim} "
+        f"gvl_adapter={resolved_enable_gvl_adapter} gvl_gate={resolved_gvl_adapter_gate_init}"
     )
 
     obj_vocab, pred_vocab, attr_vocab = build_vg_vocabs_from_file(args.scene_graphs, min_freq=int(args.min_freq))
@@ -410,6 +424,9 @@ def main() -> int:
         node_encoder_alpha_init=resolved_node_encoder_alpha,
         node_encoder_out_dim=resolved_node_encoder_out_dim,
         node_encoder_trainable=False,
+        enable_gvl_adapter=resolved_enable_gvl_adapter,
+        gvl_adapter_gate_init=resolved_gvl_adapter_gate_init,
+        enable_graph_aux_head=False,
     )
     sd = torch.load(args.ckpt, map_location="cpu")
     model_sd = model.state_dict()

@@ -1,40 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Stage2B paper-sprint profile (VG-only, stronger GQA-like transfer)
-
 WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$WORKDIR"
 
-PYTHON_BIN=${PYTHON_BIN:-python}
-GPU=${GPU:-0}
+map_var() {
+  local old_name="$1"
+  local new_name="$2"
+  if [ -n "${!old_name+x}" ] && [ -z "${!new_name+x}" ]; then
+    export "$new_name=${!old_name}"
+  fi
+}
 
-SCENE_GRAPHS=${SCENE_GRAPHS:-data/vg/contents/sceneGraphs/scene_graphs.json}
-REGIONS=${REGIONS:-data/vg/contents/regionDescriptions/region_descriptions.json}
+map_var SCENE_GRAPHS VG_SCENE_GRAPHS
+map_var REGIONS VG_REGIONS
+map_var SAVE_DIR STAGE2B_DIR
+map_var BATCH_SIZE S2B_BATCH_SIZE
+map_var PRECISION S2B_PRECISION
+map_var MAX_LENGTH S2B_MAX_LENGTH
+map_var MAX_GRAPH_TOKENS S2B_MAX_GRAPH_TOKENS
+map_var NUM_WORKERS S2B_NUM_WORKERS
+map_var ACCUM_GRAD_BATCHES S2B_ACCUM_GRAD_BATCHES
+map_var VAL_CHECK_INTERVAL S2B_VAL_CHECK_INTERVAL
+map_var VAL_RATIO S2B_VAL_RATIO
+map_var PATIENCE S2B_PATIENCE
+map_var MIN_DELTA S2B_MIN_DELTA
+map_var LR S2B_LR
+map_var MAX_STEPS S2B_MAX_STEPS
+map_var GRAPH_QA_MAX_PER_IMAGE S2B_GRAPH_QA_MAX_PER_IMAGE
+map_var GRAPH_QA_REPEAT S2B_GRAPH_QA_REPEAT
+map_var GRAPH_AUX_LOSS_WEIGHT S2B_GRAPH_AUX_LOSS_WEIGHT
+map_var XTC_WEIGHT S2B_XTC_WEIGHT
+map_var XTM_WEIGHT S2B_XTM_WEIGHT
 
-STAGE2A_DIR=${STAGE2A_DIR:-checkpoints_projector_vg/stage2A_paper}
-STAGE2A_META=${STAGE2A_META:-$STAGE2A_DIR/stage2A_meta.json}
-STAGE2A_FALLBACK=${STAGE2A_FALLBACK:-$STAGE2A_DIR/last.ckpt}
-STAGE2A_CKPT=${STAGE2A_CKPT:-$("$PYTHON_BIN" scripts/train/select_best_ckpt.py --meta "$STAGE2A_META" --fallback "$STAGE2A_FALLBACK")}
-
-SAVE_DIR=${SAVE_DIR:-checkpoints_projector_vg/stage2B_paper}
-
-echo "[Stage2B] using Stage2A ckpt: $STAGE2A_CKPT"
-
-"$PYTHON_BIN" omnigraph/train/train_stage2B.py \
-  --scene_graphs "$SCENE_GRAPHS" \
-  --regions "$REGIONS" \
-  --stage2A_ckpt "$STAGE2A_CKPT" \
-  --graph_qa_max_per_image 6 \
-  --graph_qa_repeat 4 \
-  --gpu "$GPU" \
-  --batch_size 3 \
-  --precision 16 \
-  --max_length 256 \
-  --lr 1.2e-5 \
-  --max_steps 60000 \
-  --val_ratio 0.02 \
-  --val_check_interval 1000 \
-  --patience 16 \
-  --min_delta 0.0005 \
-  --save_dir "$SAVE_DIR"
+export PIPELINE_MODE=stage2b
+exec bash "$WORKDIR/scripts/train/run_4090_gqa_sprint.sh"

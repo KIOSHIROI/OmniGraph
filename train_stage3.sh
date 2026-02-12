@@ -1,42 +1,39 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Stage3 paper-sprint profile (VG-only, stronger GQA-like transfer)
-
 WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$WORKDIR"
 
-PYTHON_BIN=${PYTHON_BIN:-python}
-GPU=${GPU:-0}
+map_var() {
+  local old_name="$1"
+  local new_name="$2"
+  if [ -n "${!old_name+x}" ] && [ -z "${!new_name+x}" ]; then
+    export "$new_name=${!old_name}"
+  fi
+}
 
-SCENE_GRAPHS=${SCENE_GRAPHS:-data/vg/contents/sceneGraphs/scene_graphs.json}
-REGIONS=${REGIONS:-data/vg/contents/regionDescriptions/region_descriptions.json}
-IMAGE_ROOT=${IMAGE_ROOT:-data/vg}
+map_var SCENE_GRAPHS VG_SCENE_GRAPHS
+map_var REGIONS VG_REGIONS
+map_var IMAGE_ROOT VG_IMAGE_ROOT
+map_var SAVE_DIR STAGE3_DIR
+map_var BATCH_SIZE S3_BATCH_SIZE
+map_var PRECISION S3_PRECISION
+map_var MAX_LENGTH S3_MAX_LENGTH
+map_var MAX_GRAPH_TOKENS S3_MAX_GRAPH_TOKENS
+map_var MAX_VISION_TOKENS S3_MAX_VISION_TOKENS
+map_var NUM_WORKERS S3_NUM_WORKERS
+map_var ACCUM_GRAD_BATCHES S3_ACCUM_GRAD_BATCHES
+map_var VAL_CHECK_INTERVAL S3_VAL_CHECK_INTERVAL
+map_var VAL_RATIO S3_VAL_RATIO
+map_var PATIENCE S3_PATIENCE
+map_var MIN_DELTA S3_MIN_DELTA
+map_var LR S3_LR
+map_var MAX_STEPS S3_MAX_STEPS
+map_var GRAPH_QA_MAX_PER_IMAGE S3_GRAPH_QA_MAX_PER_IMAGE
+map_var GRAPH_QA_REPEAT S3_GRAPH_QA_REPEAT
+map_var GRAPH_AUX_LOSS_WEIGHT S3_GRAPH_AUX_LOSS_WEIGHT
+map_var XTC_WEIGHT S3_XTC_WEIGHT
+map_var XTM_WEIGHT S3_XTM_WEIGHT
 
-STAGE2B_DIR=${STAGE2B_DIR:-checkpoints_projector_vg/stage2B_paper}
-STAGE2B_META=${STAGE2B_META:-$STAGE2B_DIR/stage2B_meta.json}
-STAGE2B_FALLBACK=${STAGE2B_FALLBACK:-$STAGE2B_DIR/last.ckpt}
-STAGE2B_CKPT=${STAGE2B_CKPT:-$("$PYTHON_BIN" scripts/train/select_best_ckpt.py --meta "$STAGE2B_META" --fallback "$STAGE2B_FALLBACK")}
-
-SAVE_DIR=${SAVE_DIR:-checkpoints_stage3_paper}
-
-echo "[Stage3] using Stage2B ckpt: $STAGE2B_CKPT"
-
-"$PYTHON_BIN" omnigraph/train/train_stage3.py \
-  --scene_graphs "$SCENE_GRAPHS" \
-  --regions "$REGIONS" \
-  --image_root "$IMAGE_ROOT" \
-  --stage2B_ckpt "$STAGE2B_CKPT" \
-  --graph_qa_max_per_image 4 \
-  --graph_qa_repeat 2 \
-  --gpu "$GPU" \
-  --batch_size 2 \
-  --precision 16 \
-  --max_length 256 \
-  --lr 2e-5 \
-  --max_steps 50000 \
-  --val_ratio 0.02 \
-  --val_check_interval 1000 \
-  --patience 14 \
-  --min_delta 0.0005 \
-  --save_dir "$SAVE_DIR"
+export PIPELINE_MODE=stage3
+exec bash "$WORKDIR/scripts/train/run_4090_gqa_sprint.sh"

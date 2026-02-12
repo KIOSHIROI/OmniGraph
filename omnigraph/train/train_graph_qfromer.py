@@ -18,7 +18,7 @@ from transformers import AutoModel, AutoTokenizer, BertTokenizer
 from torch_geometric.data import Data, Batch
 from torch_geometric.utils import to_dense_batch
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, LearningRateMonitor
 
 
 from omnigraph.model.graph.builder import build_graph_tower
@@ -392,14 +392,14 @@ class GraphQFormerStage1PL((pl.LightningModule if pl is not None else nn.Module)
         loss = outputs['loss']
         
         # Logging
-        self.log("train_loss", loss, prog_bar=True, batch_size=len(text_input))
-        self.log("train_loss_gtm", outputs['loss_gtm'], prog_bar=True, batch_size=len(text_input))
-        self.log("train_acc_gtm", outputs['acc_gtm'], prog_bar=True, batch_size=len(text_input))
-        self.log("train_loss_gtc", outputs['loss_gtc'], prog_bar=True, batch_size=len(text_input))
+        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=len(text_input))
+        self.log("train_loss_gtm", outputs['loss_gtm'], prog_bar=True, on_step=True, on_epoch=True, batch_size=len(text_input))
+        self.log("train_acc_gtm", outputs['acc_gtm'], prog_bar=True, on_step=True, on_epoch=True, batch_size=len(text_input))
+        self.log("train_loss_gtc", outputs['loss_gtc'], prog_bar=True, on_step=True, on_epoch=True, batch_size=len(text_input))
         if self.aux_node_text_weight > 0:
-            self.log("train_loss_aux_node", outputs['loss_aux_node'], prog_bar=True, batch_size=len(text_input))
+            self.log("train_loss_aux_node", outputs['loss_aux_node'], prog_bar=True, on_step=True, on_epoch=True, batch_size=len(text_input))
         if self.aux_neigh_text_weight > 0:
-            self.log("train_loss_aux_neigh", outputs['loss_aux_neigh'], prog_bar=True, batch_size=len(text_input))
+            self.log("train_loss_aux_neigh", outputs['loss_aux_neigh'], prog_bar=True, on_step=True, on_epoch=True, batch_size=len(text_input))
         
         return loss
 
@@ -604,6 +604,11 @@ def main():
     parser.add_argument("--text_model_name", type=str, default="sentence-transformers/all-mpnet-base-v2")
     parser.add_argument("--text_max_len", type=int, default=512)
     parser.add_argument("--gtm_max_len", type=int, default=512)
+    parser.add_argument("--max_steps", type=int, default=-1, help="If >0, hard stop after this many optimizer steps.")
+    parser.add_argument("--enable_early_stop", type=int, default=1, choices=[0, 1], help="Enable early stopping on train_loss_epoch.")
+    parser.add_argument("--early_stop_patience", type=int, default=2, help="Early stop patience in epochs.")
+    parser.add_argument("--early_stop_min_delta", type=float, default=1e-3, help="Minimum train loss improvement.")
+    parser.add_argument("--early_stop_mode", type=str, default="min", choices=["min", "max"], help="Early stop mode.")
     args = parser.parse_args()
 
     setup_env(hf_endpoint=args.hf_endpoint, hf_cache_dir=args.hf_cache_dir)
@@ -611,6 +616,8 @@ def main():
     BATCH_SIZE = args.batch_size
     LR = args.lr
     EPOCHS = args.epochs
+    MAX_STEPS = int(args.max_steps)
+    ENABLE_EARLY_STOP = bool(int(args.enable_early_stop))
     
     dataset_paths = args.dataset_paths
     # Check if at least one exists
@@ -646,19 +653,32 @@ def main():
     if pl is not None:
         checkpoint_callback = ModelCheckpoint(
             dirpath="checkpoints_stage1",
-            filename="graph_qformer_stage1-{epoch:02d}-{train_loss:.2f}",
+            filename="graph_qformer_stage1-{epoch:02d}-{train_loss_epoch:.2f}",
             save_top_k=1,
-            monitor="train_loss",
+            monitor="train_loss_epoch",
             mode="min"
         )
         lr_monitor = LearningRateMonitor(logging_interval='step')
+        callbacks = [checkpoint_callback, lr_monitor]
+        if ENABLE_EARLY_STOP:
+            callbacks.append(
+                EarlyStopping(
+                    monitor="train_loss_epoch",
+                    mode=str(args.early_stop_mode),
+                    patience=int(args.early_stop_patience),
+                    min_delta=float(args.early_stop_min_delta),
+                    check_on_train_epoch_end=True,
+                    verbose=True,
+                )
+            )
         
         trainer = pl.Trainer(
             max_epochs=EPOCHS,
+            max_steps=MAX_STEPS if MAX_STEPS > 0 else -1,
             accelerator="gpu" if torch.cuda.is_available() else "cpu",
             devices=1,
             precision="16-mixed",
-            callbacks=[checkpoint_callback, lr_monitor],
+            callbacks=callbacks,
             log_every_n_steps=10,
             gradient_clip_val=1.0,
             accumulate_grad_batches=8,
@@ -672,6 +692,9 @@ def main():
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         optimizer = AdamW(trainable_params, lr=LR)
         model.train()
+        global_step = 0
+        best_epoch_loss = float("inf")
+        no_improve_epochs = 0
         
         for epoch in range(EPOCHS):
             t0 = time.time()
@@ -690,10 +713,30 @@ def main():
                 optimizer.step()
                 running += float(loss.detach().cpu())
                 steps += 1
+                global_step += 1
+                if MAX_STEPS > 0 and global_step >= MAX_STEPS:
+                    print(f"[Stage1] Reached max_steps={MAX_STEPS}, stopping.")
+                    break
                 # if batch_idx >= 50:
                 #     break
             dt = time.time() - t0
-            print(f"epoch={epoch} loss={running/max(steps,1):.4f} time={dt:.1f}s")
+            epoch_loss = running / max(steps, 1)
+            print(f"epoch={epoch} loss={epoch_loss:.4f} time={dt:.1f}s")
+            if ENABLE_EARLY_STOP:
+                improved = (best_epoch_loss - epoch_loss) > float(args.early_stop_min_delta)
+                if improved:
+                    best_epoch_loss = epoch_loss
+                    no_improve_epochs = 0
+                else:
+                    no_improve_epochs += 1
+                    if no_improve_epochs >= int(args.early_stop_patience):
+                        print(
+                            f"[Stage1] Early stop triggered: no improvement for "
+                            f"{args.early_stop_patience} epoch(s)."
+                        )
+                        break
+            if MAX_STEPS > 0 and global_step >= MAX_STEPS:
+                break
     
     # Save final model
     print("Training finished.")

@@ -21,6 +21,7 @@ from omnigraph.utils.env import setup_env  # noqa: E402
 setup_env()
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch.optim import AdamW
@@ -37,9 +38,22 @@ from omnigraph.data.vg_scene_graph_dataset import (  # noqa: E402
     VGSceneGraphDataset,
 )
 from omnigraph.data.vg_graph_qa import build_vg_graph_qa_records  # noqa: E402
+from omnigraph.train.common import (  # noqa: E402
+    build_binary_aux_targets,
+    build_chat_inputs_and_labels,
+    format_prompt_with_qa_type as _format_prompt_with_qa_type,
+    parse_precision as _parse_precision,
+    parse_val_check_interval as _parse_val_check_interval,
+)
 
 # Model
 from omnigraph.model.OmniGraphModel import OmniGraphModel  # noqa: E402
+from omnigraph.model.losses.multimodal_align import (  # noqa: E402
+    build_pooled_features,
+    mine_hard_negatives,
+    xtc_bidirectional_loss,
+    xtm_pair_loss,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -161,10 +175,12 @@ class VGTriModalRegionDataset(Dataset):
         qa_records: Optional[List[Dict[str, Any]]] = None,
         prompt: str = "Describe the region.",
         min_phrase_len: int = 1,
+        use_qa_type_token: bool = True,
     ):
         self.sg = sg_dataset
         self.image_root = image_root
         self.prompt = prompt
+        self.use_qa_type_token = bool(use_qa_type_token)
 
         # build image_id -> sg_dataset index
         raw_items = None
@@ -206,6 +222,7 @@ class VGTriModalRegionDataset(Dataset):
                     "w": int(rr.get("w", rr.get("width", 0)) if rr.get("w", None) is not None else 0),
                     "h": int(rr.get("h", rr.get("height", 0)) if rr.get("h", None) is not None else 0),
                     "source": "region",
+                    "qa_type": "region_caption",
                 }
             )
 
@@ -236,6 +253,7 @@ class VGTriModalRegionDataset(Dataset):
                         "w": 0,
                         "h": 0,
                         "source": "graph_qa",
+                        "qa_type": str(qa.get("qa_type", "graph_qa")),
                     }
                 )
 
@@ -269,8 +287,13 @@ class VGTriModalRegionDataset(Dataset):
             "image_id": image_id,
             "graph_data": graph_data,
             "pil_image": img,
-            "prompt": str(s.get("prompt", self.prompt)),
+            "prompt": _format_prompt_with_qa_type(
+                str(s.get("prompt", self.prompt)),
+                str(s.get("qa_type", "unknown")),
+                self.use_qa_type_token,
+            ),
             "answer": str(s["phrase"]),
+            "qa_type": str(s.get("qa_type", "unknown")),
         }
 
 
@@ -360,6 +383,7 @@ def collate_tri(batch: List[Dict[str, Any]], processor: Any) -> Dict[str, Any]:
     answers = [b["answer"] for b in batch]
     ids = [b["id"] for b in batch]
     image_ids = [b["image_id"] for b in batch]
+    qa_types = [str(b.get("qa_type", "unknown")) for b in batch]
 
     return {
         "ids": ids,
@@ -368,67 +392,8 @@ def collate_tri(batch: List[Dict[str, Any]], processor: Any) -> Dict[str, Any]:
         "pixel_values": pixel_values,
         "prompts": prompts,
         "answers": answers,
+        "qa_type": qa_types,
     }
-
-
-# ---------------------------------------------------------------------------
-# Tokenization: chat inputs + labels masking prompt tokens
-# ---------------------------------------------------------------------------
-
-def build_chat_inputs_and_labels(
-    tokenizer: Any,
-    prompts: List[str],
-    answers: List[str],
-    device: torch.device,
-    max_length: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    use_chat = hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None) is not None
-
-    input_ids_list: List[torch.Tensor] = []
-    labels_list: List[torch.Tensor] = []
-    attn_list: List[torch.Tensor] = []
-
-    for p, a in zip(prompts, answers):
-        p = p or ""
-        a = a or ""
-
-        if use_chat:
-            messages_full = [{"role": "user", "content": p}, {"role": "assistant", "content": a}]
-            full_text = tokenizer.apply_chat_template(messages_full, tokenize=False, add_generation_prompt=False)
-
-            messages_prompt = [{"role": "user", "content": p}]
-            prompt_text = tokenizer.apply_chat_template(messages_prompt, tokenize=False, add_generation_prompt=True)
-
-            full = tokenizer(full_text, return_tensors="pt", truncation=True, max_length=max_length)
-            prompt_tok = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=max_length)
-
-            full_ids = full["input_ids"][0]
-            prompt_len = int(prompt_tok["input_ids"].shape[1])
-
-            labels = full_ids.clone()
-            labels[:prompt_len] = -100
-
-            attn = full.get("attention_mask", torch.ones_like(full_ids))
-            if attn.dim() > 1:
-                attn = attn[0]
-        else:
-            # fallback: train only answer tokens
-            full = tokenizer(a, return_tensors="pt", truncation=True, max_length=max_length)
-            full_ids = full["input_ids"][0]
-            labels = full_ids.clone()
-            attn = full.get("attention_mask", torch.ones_like(full_ids))
-            if attn.dim() > 1:
-                attn = attn[0]
-
-        input_ids_list.append(full_ids)
-        labels_list.append(labels)
-        attn_list.append(attn)
-
-    pad_id = tokenizer.pad_token_id
-    input_ids = torch.nn.utils.rnn.pad_sequence(input_ids_list, batch_first=True, padding_value=pad_id).to(device)
-    labels = torch.nn.utils.rnn.pad_sequence(labels_list, batch_first=True, padding_value=-100).to(device)
-    attention_mask = torch.nn.utils.rnn.pad_sequence(attn_list, batch_first=True, padding_value=0).to(device)
-    return input_ids, attention_mask, labels
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +478,16 @@ class Stage3PL(pl.LightningModule):
         node_encoder_out_dim: int = 128,
         train_node_encoder: bool = False,
         node_encoder_alpha_init: float = 0.3,
+        enable_gvl_adapter: bool = True,
+        gvl_adapter_gate_init: float = 0.1,
+        enable_graph_aux_head: bool = True,
+        graph_aux_loss_weight: float = 0.0,
+        enable_xtc: bool = True,
+        enable_xtm: bool = True,
+        xtc_weight: float = 0.05,
+        xtm_weight: float = 0.03,
+        xtc_logit_scale_init: float = 2.66,
+        xtm_dup_thresh: float = 0.98,
         auto_resize_token_embeddings: bool = True,
     ):
         super().__init__()
@@ -533,7 +508,35 @@ class Stage3PL(pl.LightningModule):
             node_encoder_out_dim=int(node_encoder_out_dim),
             node_encoder_trainable=bool(train_node_encoder),
             node_encoder_alpha_init=float(node_encoder_alpha_init),
+            enable_gvl_adapter=bool(enable_gvl_adapter),
+            gvl_adapter_num_heads=8,
+            gvl_adapter_gate_init=float(gvl_adapter_gate_init),
+            enable_graph_aux_head=bool(enable_graph_aux_head),
+            graph_aux_dropout=0.1,
         )
+        self.graph_aux_loss_weight = max(0.0, float(graph_aux_loss_weight))
+        self.enable_xtc = bool(enable_xtc)
+        self.enable_xtm = bool(enable_xtm)
+        self.xtc_weight = max(0.0, float(xtc_weight))
+        self.xtm_weight = max(0.0, float(xtm_weight))
+        self.xtm_dup_thresh = float(xtm_dup_thresh)
+        self.xtc_logit_scale = nn.Parameter(torch.tensor(float(xtc_logit_scale_init), dtype=torch.float32))
+        self.xtc_logit_scale.requires_grad = bool(self.enable_xtc)
+        self.alignment_config = {
+            "enable_xtc": bool(self.enable_xtc),
+            "enable_xtm": bool(self.enable_xtm),
+            "xtc_weight": float(self.xtc_weight),
+            "xtm_weight": float(self.xtm_weight),
+            "xtc_logit_scale_init": float(xtc_logit_scale_init),
+            "xtm_dup_thresh": float(self.xtm_dup_thresh),
+        }
+        self._xtm_stats_accum: Dict[str, float] = {
+            "steps": 0.0,
+            "hard_valid_ratio_sum": 0.0,
+            "fallback_count_sum": 0.0,
+            "same_image_blocked_pairs_sum": 0.0,
+            "near_dup_blocked_pairs_sum": 0.0,
+        }
 
         # strict pipeline: Stage3 always initializes from Stage2B ckpt
         self.stage2B_provenance = load_stage2b_weights_only_into_model(self.model, stage2B_ckpt)
@@ -544,6 +547,8 @@ class Stage3PL(pl.LightningModule):
             p.requires_grad = (
                 ("gl_projector" in name)
                 or ("vl_projector" in name)
+                or ("gvl_adapter" in name)
+                or ("graph_aux_head" in name)
                 or (self.train_node_encoder and (name.startswith("node_encoder.") or ("vg_adapter" in name)))
             )
         print(
@@ -571,13 +576,42 @@ class Stage3PL(pl.LightningModule):
 
     def configure_optimizers(self):
         params = [p for p in self.model.parameters() if p.requires_grad]
+        if self.xtc_logit_scale.requires_grad:
+            params.append(self.xtc_logit_scale)
         return AdamW(params, lr=float(self.hparams.lr))
 
-    def _step(self, batch: Dict[str, Any]) -> torch.Tensor:
+    def _update_xtm_stats(self, stats: Dict[str, Any]) -> None:
+        self._xtm_stats_accum["steps"] += 1.0
+        self._xtm_stats_accum["hard_valid_ratio_sum"] += float(stats.get("hard_valid_ratio", 0.0))
+        self._xtm_stats_accum["fallback_count_sum"] += float(stats.get("fallback_count", 0.0))
+        self._xtm_stats_accum["same_image_blocked_pairs_sum"] += float(stats.get("same_image_blocked_pairs", 0.0))
+        self._xtm_stats_accum["near_dup_blocked_pairs_sum"] += float(stats.get("near_dup_blocked_pairs", 0.0))
+
+    def get_xtm_stats_summary(self) -> Dict[str, float]:
+        steps = max(1.0, float(self._xtm_stats_accum.get("steps", 0.0)))
+        if self._xtm_stats_accum.get("steps", 0.0) <= 0:
+            return {
+                "steps": 0.0,
+                "avg_hard_valid_ratio": 0.0,
+                "avg_fallback_count": 0.0,
+                "avg_same_image_blocked_pairs": 0.0,
+                "avg_near_dup_blocked_pairs": 0.0,
+            }
+        return {
+            "steps": float(self._xtm_stats_accum["steps"]),
+            "avg_hard_valid_ratio": float(self._xtm_stats_accum["hard_valid_ratio_sum"] / steps),
+            "avg_fallback_count": float(self._xtm_stats_accum["fallback_count_sum"] / steps),
+            "avg_same_image_blocked_pairs": float(self._xtm_stats_accum["same_image_blocked_pairs_sum"] / steps),
+            "avg_near_dup_blocked_pairs": float(self._xtm_stats_accum["near_dup_blocked_pairs_sum"] / steps),
+        }
+
+    def _step(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         graph_data = batch["graph_data"].to(self.device)
         pixel_values = batch["pixel_values"].to(self.device)
+        image_ids: List[int] = [int(x) for x in batch.get("image_ids", [])]
         prompts = batch["prompts"]
         answers = batch["answers"]
+        qa_types = batch.get("qa_type", ["unknown"] * len(prompts))
 
         input_ids, attention_mask, labels = build_chat_inputs_and_labels(
             tokenizer=self.tokenizer,
@@ -586,6 +620,11 @@ class Stage3PL(pl.LightningModule):
             device=self.device,
             max_length=self.max_length,
         )
+        aux_binary_labels, aux_binary_mask = build_binary_aux_targets(
+            qa_types=qa_types,
+            answers=answers,
+            device=self.device,
+        )
 
         outputs = self.model(
             graph_data=graph_data,
@@ -593,6 +632,10 @@ class Stage3PL(pl.LightningModule):
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
+            aux_binary_labels=aux_binary_labels,
+            aux_binary_mask=aux_binary_mask,
+            aux_loss_weight=float(self.graph_aux_loss_weight),
+            return_alignment_features=bool(self.enable_xtc or self.enable_xtm),
             return_debug=False,
         )
 
@@ -601,53 +644,101 @@ class Stage3PL(pl.LightningModule):
             # fallback: fp32 CE
             logits = getattr(outputs, "logits", None)
             if logits is None:
-                return torch.tensor(0.0, device=self.device)
-            shift_logits = logits[:, :-1, :].float().contiguous()
-            shift_labels = labels[:, 1:].contiguous()
-            L = min(shift_logits.size(1), shift_labels.size(1))
-            shift_logits = shift_logits[:, :L, :]
-            shift_labels = shift_labels[:, :L]
-            if (shift_labels != -100).any():
-                loss = F.cross_entropy(
-                    shift_logits.reshape(-1, shift_logits.size(-1)),
-                    shift_labels.reshape(-1),
-                    ignore_index=-100,
-                )
-            else:
                 loss = torch.tensor(0.0, device=self.device)
-        return loss
+            else:
+                shift_logits = logits[:, :-1, :].float().contiguous()
+                shift_labels = labels[:, 1:].contiguous()
+                L = min(shift_logits.size(1), shift_labels.size(1))
+                shift_logits = shift_logits[:, :L, :]
+                shift_labels = shift_labels[:, :L]
+                if (shift_labels != -100).any():
+                    loss = F.cross_entropy(
+                        shift_logits.reshape(-1, shift_logits.size(-1)),
+                        shift_labels.reshape(-1),
+                        ignore_index=-100,
+                    )
+                else:
+                    loss = torch.tensor(0.0, device=self.device)
+        base_loss = loss
+
+        aux_loss = getattr(outputs, "aux_loss", None)
+        aux_w = float(getattr(outputs, "aux_loss_weight", 0.0))
+        if aux_loss is None:
+            aux_loss = torch.tensor(0.0, device=self.device)
+            aux_w = 0.0
+        lm_loss = base_loss - (aux_loss * aux_w)
+
+        loss_xtc = torch.tensor(0.0, device=self.device)
+        loss_xtm = torch.tensor(0.0, device=self.device)
+        xtm_acc = torch.tensor(0.0, device=self.device)
+        valid_neg_ratio = torch.tensor(0.0, device=self.device)
+
+        do_align = bool(self.enable_xtc or self.enable_xtm)
+        if do_align and len(prompts) >= 2:
+            pooled = build_pooled_features(
+                graph_embeds=getattr(outputs, "graph_embeds", None),
+                text_embeds=getattr(outputs, "text_embeds", None),
+                text_attention_mask=getattr(outputs, "text_attention_mask", None),
+            )
+            z_graph = pooled.get("graph", None)
+            z_text = pooled.get("text", None)
+            if z_graph is not None and z_text is not None and z_graph.size(0) >= 2 and z_text.size(0) >= 2:
+                if self.enable_xtc and self.xtc_weight > 0.0:
+                    logit_scale = self.xtc_logit_scale.exp().clamp(max=100.0)
+                    loss_xtc, _ = xtc_bidirectional_loss(z_graph, z_text, logit_scale)
+                if self.enable_xtm and self.xtm_weight > 0.0:
+                    text_sim = z_text @ z_text.t()
+                    neg_idx, hard_valid_mask, stats = mine_hard_negatives(
+                        sim=text_sim,
+                        image_ids=image_ids if image_ids else list(range(z_text.size(0))),
+                        qa_types=qa_types,
+                        dup_thresh=float(self.xtm_dup_thresh),
+                    )
+                    self._update_xtm_stats(stats)
+                    valid_neg_ratio = hard_valid_mask.float().mean()
+                    pos_logits = (z_graph * z_text).sum(dim=-1)
+                    neg_logits = (z_graph * z_text[neg_idx]).sum(dim=-1)
+                    loss_xtm, xtm_acc = xtm_pair_loss(pos_logits, neg_logits)
+
+        total_loss = base_loss + (self.xtc_weight * loss_xtc) + (self.xtm_weight * loss_xtm)
+        metrics = {
+            "loss_lm": lm_loss.detach(),
+            "loss_aux": aux_loss.detach(),
+            "loss_xtc": loss_xtc.detach(),
+            "loss_xtm": loss_xtm.detach(),
+            "xtm_acc": xtm_acc.detach(),
+            "xtm_valid_neg_ratio": valid_neg_ratio.detach(),
+        }
+        return total_loss, metrics
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
-        loss = self._step(batch)
-        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=len(batch["prompts"]))
+        loss, metrics = self._step(batch)
+        bsz = len(batch["prompts"])
+        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=bsz)
+        self.log("train_loss_lm", metrics["loss_lm"], prog_bar=False, on_step=True, on_epoch=True, batch_size=bsz)
+        self.log("train_loss_aux", metrics["loss_aux"], prog_bar=False, on_step=True, on_epoch=True, batch_size=bsz)
+        self.log("train_loss_xtc", metrics["loss_xtc"], prog_bar=False, on_step=True, on_epoch=True, batch_size=bsz)
+        self.log("train_loss_xtm", metrics["loss_xtm"], prog_bar=False, on_step=True, on_epoch=True, batch_size=bsz)
+        self.log("train_xtm_acc", metrics["xtm_acc"], prog_bar=False, on_step=True, on_epoch=True, batch_size=bsz)
+        self.log("train_xtm_valid_neg_ratio", metrics["xtm_valid_neg_ratio"], prog_bar=False, on_step=True, on_epoch=True, batch_size=bsz)
         return loss
 
     def validation_step(self, batch: Dict[str, Any], batch_idx: int):
-        loss = self._step(batch)
-        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=len(batch["prompts"]))
+        loss, metrics = self._step(batch)
+        bsz = len(batch["prompts"])
+        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=bsz)
+        self.log("val_loss_lm", metrics["loss_lm"], prog_bar=False, on_step=False, on_epoch=True, batch_size=bsz)
+        self.log("val_loss_aux", metrics["loss_aux"], prog_bar=False, on_step=False, on_epoch=True, batch_size=bsz)
+        self.log("val_loss_xtc", metrics["loss_xtc"], prog_bar=False, on_step=False, on_epoch=True, batch_size=bsz)
+        self.log("val_loss_xtm", metrics["loss_xtm"], prog_bar=False, on_step=False, on_epoch=True, batch_size=bsz)
+        self.log("val_xtm_acc", metrics["xtm_acc"], prog_bar=False, on_step=False, on_epoch=True, batch_size=bsz)
+        self.log("val_xtm_valid_neg_ratio", metrics["xtm_valid_neg_ratio"], prog_bar=False, on_step=False, on_epoch=True, batch_size=bsz)
         return loss
 
 
 # ---------------------------------------------------------------------------
 # Entry
 # ---------------------------------------------------------------------------
-
-def _parse_val_check_interval(x: float) -> float | int:
-    x = float(x)
-    if x >= 1.0:
-        return int(x)
-    if x <= 0.0:
-        return 1.0
-    return x
-
-
-def _parse_precision(v: str) -> int | str:
-    s = str(v).strip()
-    if s.lstrip("-").isdigit():
-        return int(s)
-    return s
-
-
 def main():
     ap = argparse.ArgumentParser()
 
@@ -675,6 +766,17 @@ def main():
     ap.add_argument("--node_encoder_out_dim", type=int, default=128, help="Graph node encoder output dim.")
     ap.add_argument("--train_node_encoder", type=int, default=0, choices=[0, 1], help="1=train node encoder, 0=freeze.")
     ap.add_argument("--node_encoder_alpha_init", type=float, default=0.3, help="Hybrid node encoder alpha init.")
+    ap.add_argument("--use_qa_type_token", type=int, default=1, choices=[0, 1], help="Prefix prompt with QA type control token.")
+    ap.add_argument("--enable_gvl_adapter", type=int, default=1, choices=[0, 1], help="Enable graph-vision-language cross-attn adapter.")
+    ap.add_argument("--gvl_adapter_gate_init", type=float, default=0.1, help="Initial gate for cross-modal adapter.")
+    ap.add_argument("--enable_graph_aux_head", type=int, default=1, choices=[0, 1], help="Enable auxiliary graph reasoning binary head.")
+    ap.add_argument("--graph_aux_loss_weight", type=float, default=0.05, help="Auxiliary binary loss weight.")
+    ap.add_argument("--enable_xtc", type=int, default=1, choices=[0, 1], help="Enable bidirectional graph-text contrastive loss.")
+    ap.add_argument("--enable_xtm", type=int, default=1, choices=[0, 1], help="Enable graph-text matching loss with hard negatives.")
+    ap.add_argument("--xtc_weight", type=float, default=0.05, help="Weight for XTC loss.")
+    ap.add_argument("--xtm_weight", type=float, default=0.03, help="Weight for XTM loss.")
+    ap.add_argument("--xtc_logit_scale_init", type=float, default=2.66, help="Initial logit scale parameter (log space).")
+    ap.add_argument("--xtm_dup_thresh", type=float, default=0.98, help="Cosine similarity threshold for duplicate-text negative filtering.")
 
     ap.add_argument("--lr", type=float, default=5e-5)
     ap.add_argument("--max_steps", type=int, default=20000)
@@ -760,6 +862,7 @@ def main():
         image_root=args.image_root,
         qa_records=qa_records,
         prompt=str(args.prompt),
+        use_qa_type_token=bool(int(args.use_qa_type_token)),
     )
     print(f"[Join] usable_samples={len(full_dataset)}")
 
@@ -815,6 +918,16 @@ def main():
         node_encoder_out_dim=int(args.node_encoder_out_dim),
         train_node_encoder=bool(int(args.train_node_encoder)),
         node_encoder_alpha_init=float(args.node_encoder_alpha_init),
+        enable_gvl_adapter=bool(int(args.enable_gvl_adapter)),
+        gvl_adapter_gate_init=float(args.gvl_adapter_gate_init),
+        enable_graph_aux_head=bool(int(args.enable_graph_aux_head)),
+        graph_aux_loss_weight=float(args.graph_aux_loss_weight),
+        enable_xtc=bool(int(args.enable_xtc)),
+        enable_xtm=bool(int(args.enable_xtm)),
+        xtc_weight=float(args.xtc_weight),
+        xtm_weight=float(args.xtm_weight),
+        xtc_logit_scale_init=float(args.xtc_logit_scale_init),
+        xtm_dup_thresh=float(args.xtm_dup_thresh),
         auto_resize_token_embeddings=True,
     )
 
@@ -873,6 +986,9 @@ def main():
         "num_attr": int(num_attr),
         "stage2B_provenance": pl_model.stage2B_provenance,
         "node_encoder_config": pl_model.model.node_encoder_config,
+        "architecture_config": pl_model.model.architecture_config,
+        "alignment_config": pl_model.alignment_config,
+        "xtm_stats_summary": pl_model.get_xtm_stats_summary(),
         "best_ckpt": ckpt_cb.best_model_path or "",
         "export_path": str(export_path),
     }
