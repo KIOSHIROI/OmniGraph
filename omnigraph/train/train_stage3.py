@@ -399,8 +399,42 @@ def collate_tri(batch: List[Dict[str, Any]], processor: Any) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Checkpoint loading: strict Stage2B ckpt only
 # ---------------------------------------------------------------------------
+def _normalize_graph_tokenizer_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    t = str(cfg.get("type", "qformer")).strip().lower()
+    if t not in {"qformer", "perceiver"}:
+        raise RuntimeError(f"Unsupported graph tokenizer type in provenance: {t}")
+    out = {
+        "type": t,
+        "num_latents": int(cfg.get("num_latents", cfg.get("num_query_tokens", 32))),
+        "hidden_dim": int(cfg.get("hidden_dim", cfg.get("qformer_hidden_dim", 768))),
+        "num_layers": int(cfg.get("num_layers", 3)),
+        "num_heads": int(cfg.get("num_heads", 8)),
+        "ff_mult": int(cfg.get("ff_mult", 4)),
+        "dropout": float(cfg.get("dropout", 0.0)),
+    }
+    return out
 
-def load_stage2b_weights_only_into_model(model: OmniGraphModel, stage2b_ckpt_path: str) -> Dict[str, Any]:
+
+def _assert_graph_tokenizer_match(expected_cfg: Dict[str, Any], got_cfg: Dict[str, Any], stage_name: str) -> None:
+    if str(expected_cfg.get("type")) != str(got_cfg.get("type")):
+        raise RuntimeError(
+            f"{stage_name} graph tokenizer type mismatch: expected={expected_cfg.get('type')} got={got_cfg.get('type')}"
+        )
+    if str(got_cfg.get("type")) == "perceiver":
+        for k in ("num_latents", "hidden_dim", "num_layers", "num_heads", "ff_mult"):
+            if int(expected_cfg.get(k)) != int(got_cfg.get(k)):
+                raise RuntimeError(
+                    f"{stage_name} perceiver config mismatch on {k}: "
+                    f"expected={expected_cfg.get(k)} got={got_cfg.get(k)}"
+                )
+        if abs(float(expected_cfg.get("dropout")) - float(got_cfg.get("dropout"))) > 1e-6:
+            raise RuntimeError(
+                f"{stage_name} perceiver config mismatch on dropout: "
+                f"expected={expected_cfg.get('dropout')} got={got_cfg.get('dropout')}"
+            )
+
+
+def _extract_stage2b_provenance_from_ckpt(stage2b_ckpt_path: str) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     p = Path(stage2b_ckpt_path)
     if not p.exists():
         raise FileNotFoundError(f"--stage2B_ckpt not found: {stage2b_ckpt_path}")
@@ -416,6 +450,61 @@ def load_stage2b_weights_only_into_model(model: OmniGraphModel, stage2b_ckpt_pat
             "Stage2B checkpoint metadata missing 'stage2A_ckpt'. "
             "Use Stage2B checkpoint generated from strict pipeline."
         )
+
+    stage2a_bootstrap = hp.get("stage2A_bootstrap")
+    if not isinstance(stage2a_bootstrap, dict):
+        stage1_qformer_ckpt = hp.get("stage1_qformer_ckpt", None)
+        guessed_mode = "legacy_stage1" if stage1_qformer_ckpt else "no_stage1"
+        guessed_tok = str(hp.get("graph_tokenizer_type", "qformer" if guessed_mode == "legacy_stage1" else "perceiver")).strip().lower()
+        stage2a_bootstrap = {
+            "mode": guessed_mode,
+            "graph_tokenizer_type": guessed_tok,
+            "stage1_qformer_ckpt": stage1_qformer_ckpt,
+        }
+    mode = str(stage2a_bootstrap.get("mode", "")).strip().lower()
+    tok = str(stage2a_bootstrap.get("graph_tokenizer_type", "")).strip().lower()
+    if mode not in {"legacy_stage1", "no_stage1"}:
+        raise RuntimeError(f"Invalid Stage2B->Stage3 bootstrap mode: {mode}")
+    if tok not in {"qformer", "perceiver"}:
+        raise RuntimeError(f"Invalid Stage2B->Stage3 graph tokenizer type: {tok}")
+
+    raw_cfg = hp.get("graph_tokenizer_config")
+    if isinstance(raw_cfg, dict):
+        graph_tokenizer_config = _normalize_graph_tokenizer_config(raw_cfg)
+    else:
+        graph_tokenizer_config = _normalize_graph_tokenizer_config(
+            {
+                "type": tok,
+                "num_latents": hp.get("perceiver_num_latents", 32),
+                "hidden_dim": hp.get("perceiver_hidden_dim", 768),
+                "num_layers": hp.get("perceiver_num_layers", 3),
+                "num_heads": hp.get("perceiver_num_heads", 8),
+                "ff_mult": hp.get("perceiver_ff_mult", 4),
+                "dropout": hp.get("perceiver_dropout", 0.0),
+            }
+        )
+    if graph_tokenizer_config["type"] != tok:
+        raise RuntimeError(
+            "Stage2B provenance mismatch: "
+            f"bootstrap type={tok}, graph_tokenizer_config type={graph_tokenizer_config['type']}"
+        )
+    return obj, stage2a_bootstrap, graph_tokenizer_config
+
+
+def load_stage2b_weights_only_into_model(
+    model: OmniGraphModel,
+    stage2b_ckpt_path: str,
+    expected_graph_tokenizer_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    p = Path(stage2b_ckpt_path)
+    obj, stage2a_bootstrap, stage2b_graph_tokenizer_config = _extract_stage2b_provenance_from_ckpt(stage2b_ckpt_path)
+    _assert_graph_tokenizer_match(
+        expected_cfg=expected_graph_tokenizer_config,
+        got_cfg=stage2b_graph_tokenizer_config,
+        stage_name="Stage3",
+    )
+    hp = obj.get("hyper_parameters", {}) or {}
+    stage2a_ckpt = hp.get("stage2A_ckpt")
 
     sd = obj["state_dict"]
     new_sd = {}
@@ -440,13 +529,65 @@ def load_stage2b_weights_only_into_model(model: OmniGraphModel, stage2b_ckpt_pat
     missing, unexpected = model.load_state_dict(filtered, strict=False)
     print(f"[Stage3] loaded weights-only from Stage2B ckpt: {p}")
     print(f"[Stage3] missing={len(missing)} unexpected={len(unexpected)}")
-    print(f"[Stage3] Stage2B provenance: stage2A_ckpt={stage2a_ckpt}")
+    print(
+        "[Stage3] Stage2B provenance: "
+        f"stage2A_ckpt={stage2a_ckpt} "
+        f"bootstrap={stage2a_bootstrap} graph_tokenizer={stage2b_graph_tokenizer_config}"
+    )
     return {
         "stage2B_ckpt": str(p),
         "stage2A_ckpt": str(stage2a_ckpt),
+        "stage2A_bootstrap": stage2a_bootstrap,
+        "graph_tokenizer_config": stage2b_graph_tokenizer_config,
         "missing_keys": len(missing),
         "unexpected_keys": len(unexpected),
     }
+
+
+def _resolve_graph_tokenizer_from_stage2b(
+    args: argparse.Namespace,
+    stage2b_graph_tokenizer_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    req_type = str(args.graph_tokenizer_type).strip().lower()
+    upstream_type = str(stage2b_graph_tokenizer_config.get("type")).strip().lower()
+    if req_type == "auto":
+        resolved_type = upstream_type
+    else:
+        resolved_type = req_type
+    if resolved_type not in {"qformer", "perceiver"}:
+        raise RuntimeError(f"Unsupported graph_tokenizer_type for Stage3: {resolved_type}")
+    if resolved_type != upstream_type:
+        raise RuntimeError(
+            "Stage3 tokenizer type must match Stage2B provenance: "
+            f"requested={resolved_type} upstream={upstream_type}"
+        )
+
+    resolved_cfg = {
+        "type": resolved_type,
+        "num_latents": int(stage2b_graph_tokenizer_config.get("num_latents", 32)),
+        "hidden_dim": int(stage2b_graph_tokenizer_config.get("hidden_dim", 768)),
+        "num_layers": int(stage2b_graph_tokenizer_config.get("num_layers", 3)),
+        "num_heads": int(stage2b_graph_tokenizer_config.get("num_heads", 8)),
+        "ff_mult": int(stage2b_graph_tokenizer_config.get("ff_mult", 4)),
+        "dropout": float(stage2b_graph_tokenizer_config.get("dropout", 0.0)),
+    }
+    if resolved_type == "perceiver":
+        if int(args.perceiver_num_latents) > 0:
+            resolved_cfg["num_latents"] = int(args.perceiver_num_latents)
+        if int(args.perceiver_num_layers) > 0:
+            resolved_cfg["num_layers"] = int(args.perceiver_num_layers)
+        if int(args.perceiver_num_heads) > 0:
+            resolved_cfg["num_heads"] = int(args.perceiver_num_heads)
+        if int(args.perceiver_ff_mult) > 0:
+            resolved_cfg["ff_mult"] = int(args.perceiver_ff_mult)
+        if float(args.perceiver_dropout) >= 0:
+            resolved_cfg["dropout"] = float(args.perceiver_dropout)
+        _assert_graph_tokenizer_match(
+            expected_cfg=stage2b_graph_tokenizer_config,
+            got_cfg=resolved_cfg,
+            stage_name="Stage3",
+        )
+    return resolved_cfg
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +615,12 @@ class Stage3PL(pl.LightningModule):
         max_vision_tokens: int | None = None,
         llm_dtype: str = "bfloat16",
         llm_attn_implementation: str = "sdpa",
+        graph_tokenizer_type: str = "qformer",
+        perceiver_num_latents: int = 32,
+        perceiver_num_layers: int = 3,
+        perceiver_num_heads: int = 8,
+        perceiver_ff_mult: int = 4,
+        perceiver_dropout: float = 0.0,
         node_encoder_type: str = "hybrid",
         node_encoder_out_dim: int = 128,
         train_node_encoder: bool = False,
@@ -504,6 +651,12 @@ class Stage3PL(pl.LightningModule):
             max_vision_tokens=max_vision_tokens,
             llm_dtype=llm_dtype,
             llm_attn_implementation=llm_attn_implementation,
+            graph_tokenizer_type=str(graph_tokenizer_type),
+            perceiver_num_latents=int(perceiver_num_latents),
+            perceiver_num_layers=int(perceiver_num_layers),
+            perceiver_num_heads=int(perceiver_num_heads),
+            perceiver_ff_mult=int(perceiver_ff_mult),
+            perceiver_dropout=float(perceiver_dropout),
             node_encoder_type=node_encoder_type,
             node_encoder_out_dim=int(node_encoder_out_dim),
             node_encoder_trainable=bool(train_node_encoder),
@@ -539,7 +692,11 @@ class Stage3PL(pl.LightningModule):
         }
 
         # strict pipeline: Stage3 always initializes from Stage2B ckpt
-        self.stage2B_provenance = load_stage2b_weights_only_into_model(self.model, stage2B_ckpt)
+        self.stage2B_provenance = load_stage2b_weights_only_into_model(
+            model=self.model,
+            stage2b_ckpt_path=stage2B_ckpt,
+            expected_graph_tokenizer_config=self.model.graph_tokenizer_config,
+        )
 
         # Freeze everything except projectors
         self.train_node_encoder = bool(train_node_encoder)
@@ -762,6 +919,12 @@ def main():
     ap.add_argument("--max_vision_tokens", type=int, default=0, help="If >0, truncate vision prefix tokens before LLM.")
     ap.add_argument("--llm_dtype", type=str, default="bfloat16", help="LLM load dtype: bfloat16/float16/float32.")
     ap.add_argument("--llm_attn_implementation", type=str, default="sdpa", help="LLM attention backend (e.g., sdpa/flash_attention_2).")
+    ap.add_argument("--graph_tokenizer_type", type=str, default="auto", choices=["auto", "qformer", "perceiver"])
+    ap.add_argument("--perceiver_num_latents", type=int, default=-1, help="<=0 means inherit from Stage2B provenance.")
+    ap.add_argument("--perceiver_num_layers", type=int, default=-1, help="<=0 means inherit from Stage2B provenance.")
+    ap.add_argument("--perceiver_num_heads", type=int, default=-1, help="<=0 means inherit from Stage2B provenance.")
+    ap.add_argument("--perceiver_ff_mult", type=int, default=-1, help="<=0 means inherit from Stage2B provenance.")
+    ap.add_argument("--perceiver_dropout", type=float, default=-1.0, help="<0 means inherit from Stage2B provenance.")
     ap.add_argument("--node_encoder_type", type=str, default="hybrid", choices=["hybrid", "open_vocab", "legacy_vg"])
     ap.add_argument("--node_encoder_out_dim", type=int, default=128, help="Graph node encoder output dim.")
     ap.add_argument("--train_node_encoder", type=int, default=0, choices=[0, 1], help="1=train node encoder, 0=freeze.")
@@ -809,6 +972,15 @@ def main():
     print("[Pipeline] Stage3 start: requires Stage2B .ckpt from strict pipeline.")
     if not Path(args.stage2B_ckpt).exists():
         raise FileNotFoundError(f"--stage2B_ckpt not found: {args.stage2B_ckpt}")
+    _, stage2b_bootstrap, stage2b_graph_tokenizer_config = _extract_stage2b_provenance_from_ckpt(args.stage2B_ckpt)
+    resolved_graph_tokenizer_config = _resolve_graph_tokenizer_from_stage2b(
+        args=args,
+        stage2b_graph_tokenizer_config=stage2b_graph_tokenizer_config,
+    )
+    print(
+        "[Stage3] resolved tokenizer from Stage2B provenance: "
+        f"bootstrap={stage2b_bootstrap} graph_tokenizer={resolved_graph_tokenizer_config}"
+    )
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -914,6 +1086,12 @@ def main():
         max_vision_tokens=(int(args.max_vision_tokens) if int(args.max_vision_tokens) > 0 else None),
         llm_dtype=str(args.llm_dtype),
         llm_attn_implementation=str(args.llm_attn_implementation),
+        graph_tokenizer_type=str(resolved_graph_tokenizer_config.get("type")),
+        perceiver_num_latents=int(resolved_graph_tokenizer_config.get("num_latents", 32)),
+        perceiver_num_layers=int(resolved_graph_tokenizer_config.get("num_layers", 3)),
+        perceiver_num_heads=int(resolved_graph_tokenizer_config.get("num_heads", 8)),
+        perceiver_ff_mult=int(resolved_graph_tokenizer_config.get("ff_mult", 4)),
+        perceiver_dropout=float(resolved_graph_tokenizer_config.get("dropout", 0.0)),
         node_encoder_type=str(args.node_encoder_type),
         node_encoder_out_dim=int(args.node_encoder_out_dim),
         train_node_encoder=bool(int(args.train_node_encoder)),
@@ -985,6 +1163,7 @@ def main():
         "num_obj": int(num_obj),
         "num_attr": int(num_attr),
         "stage2B_provenance": pl_model.stage2B_provenance,
+        "graph_tokenizer_config": pl_model.model.graph_tokenizer_config,
         "node_encoder_config": pl_model.model.node_encoder_config,
         "architecture_config": pl_model.model.architecture_config,
         "alignment_config": pl_model.alignment_config,

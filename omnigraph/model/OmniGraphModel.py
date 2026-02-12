@@ -8,6 +8,7 @@ from omnigraph.model.graph.node_encoder import build_graph_node_encoder
 from omnigraph.model.graph.builder import build_graph_tower
 from omnigraph.model.graph.graph_branch import GraphBranch
 from omnigraph.model.graph.graph_qformer import GraphQFormer, GraphQFormerConfig
+from omnigraph.model.graph.graph_perceiver import GraphPerceiverConfig, GraphPerceiverResampler
 from omnigraph.model.vision.blip2_vision_qformer import BLIP2VisionQFormer
 from omnigraph.model.projector import Projector
 from omnigraph.model.llm.llama import LlamaLLM
@@ -139,6 +140,12 @@ class OmniGraphModel(nn.Module):
                  node_encoder_out_dim: int = 128,
                  node_encoder_trainable: bool = True,
                  node_encoder_alpha_init: float = 0.3,
+                 graph_tokenizer_type: str = "qformer",
+                 perceiver_num_latents: int = 32,
+                 perceiver_num_layers: int = 3,
+                 perceiver_num_heads: int = 8,
+                 perceiver_ff_mult: int = 4,
+                 perceiver_dropout: float = 0.0,
                  enable_gvl_adapter: bool = True,
                  gvl_adapter_num_heads: int = 8,
                  gvl_adapter_gate_init: float = 0.1,
@@ -158,6 +165,14 @@ class OmniGraphModel(nn.Module):
         self.node_encoder_type = str(node_encoder_type).strip().lower() or "hybrid"
         self.node_encoder_trainable = bool(node_encoder_trainable)
         self.node_encoder_alpha_init = float(node_encoder_alpha_init)
+        self.graph_tokenizer_type = str(graph_tokenizer_type).strip().lower() or "qformer"
+        if self.graph_tokenizer_type not in {"qformer", "perceiver"}:
+            raise ValueError(f"Unsupported graph_tokenizer_type: {graph_tokenizer_type}")
+        self.perceiver_num_latents = max(1, int(perceiver_num_latents))
+        self.perceiver_num_layers = max(1, int(perceiver_num_layers))
+        self.perceiver_num_heads = max(1, int(perceiver_num_heads))
+        self.perceiver_ff_mult = max(1, int(perceiver_ff_mult))
+        self.perceiver_dropout = float(perceiver_dropout)
         self.node_encoder = build_graph_node_encoder(
             node_encoder_type=self.node_encoder_type,
             num_obj=self.num_obj,
@@ -228,12 +243,24 @@ class OmniGraphModel(nn.Module):
         for p in self.graphgpt.parameters():
             p.requires_grad = False
 
-        # Graph Q-Former (Trainable)
+        # Graph tokenizer (trainable): GraphQFormer or Perceiver Resampler.
         if pretrained_graph_qformer is not None:
-             self.graph_qformer = pretrained_graph_qformer
+            self.graph_qformer = pretrained_graph_qformer
         else:
-             graph_qformer_config = GraphQFormerConfig(graph_hidden_dim=int(self.node_encoder.out_dim))
-             self.graph_qformer = GraphQFormer(config=graph_qformer_config)
+            if self.graph_tokenizer_type == "perceiver":
+                perceiver_cfg = GraphPerceiverConfig(
+                    num_query_tokens=self.perceiver_num_latents,
+                    graph_hidden_dim=int(self.node_encoder.out_dim),
+                    qformer_hidden_dim=768,
+                    num_layers=self.perceiver_num_layers,
+                    num_heads=self.perceiver_num_heads,
+                    ff_mult=self.perceiver_ff_mult,
+                    dropout=self.perceiver_dropout,
+                )
+                self.graph_qformer = GraphPerceiverResampler(config=perceiver_cfg)
+            else:
+                graph_qformer_config = GraphQFormerConfig(graph_hidden_dim=int(self.node_encoder.out_dim))
+                self.graph_qformer = GraphQFormer(config=graph_qformer_config)
         # Ensure Q-Former is trainable (it should be by default)
         for p in self.graph_qformer.parameters():
             p.requires_grad = True
@@ -245,6 +272,22 @@ class OmniGraphModel(nn.Module):
             input_dim=self.graph_qformer.config.qformer_hidden_dim, 
             output_dim=self.hidden_size,
             type="mlp"
+        )
+        self.graph_tokenizer_config = {
+            "type": self.graph_tokenizer_type,
+            "num_latents": int(getattr(self.graph_qformer.config, "num_query_tokens", 32)),
+            "hidden_dim": int(getattr(self.graph_qformer.config, "qformer_hidden_dim", 768)),
+            "num_layers": int(getattr(self.graph_qformer.config, "num_layers", self.perceiver_num_layers)),
+            "num_heads": int(getattr(self.graph_qformer.config, "num_heads", self.perceiver_num_heads)),
+            "ff_mult": int(getattr(self.graph_qformer.config, "ff_mult", self.perceiver_ff_mult)),
+            "dropout": float(getattr(self.graph_qformer.config, "dropout", self.perceiver_dropout)),
+        }
+        print(
+            "[GraphTokenizer] "
+            f"type={self.graph_tokenizer_config['type']} "
+            f"latents={self.graph_tokenizer_config['num_latents']} "
+            f"layers={self.graph_tokenizer_config['num_layers']} "
+            f"heads={self.graph_tokenizer_config['num_heads']}"
         )
 
         # 3. Vision Branch (optional)

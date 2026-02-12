@@ -43,6 +43,21 @@ def _load_stage3_meta(ckpt_path: str) -> Dict[str, Any]:
         return {}
 
 
+def _normalize_graph_tokenizer_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    t = str(cfg.get("type", "qformer")).strip().lower()
+    if t not in {"qformer", "perceiver"}:
+        t = "qformer"
+    return {
+        "type": t,
+        "num_latents": int(cfg.get("num_latents", cfg.get("num_query_tokens", 32))),
+        "hidden_dim": int(cfg.get("hidden_dim", cfg.get("qformer_hidden_dim", 768))),
+        "num_layers": int(cfg.get("num_layers", 3)),
+        "num_heads": int(cfg.get("num_heads", 8)),
+        "ff_mult": int(cfg.get("ff_mult", 4)),
+        "dropout": float(cfg.get("dropout", 0.0)),
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Infer VG region captions with OmniGraph stage3.")
     ap.add_argument("--scene_graphs", required=True)
@@ -53,6 +68,12 @@ def main() -> int:
     ap.add_argument("--llm", default="Qwen/Qwen2.5-7B-Instruct")
     ap.add_argument("--vision", default="Salesforce/blip2-flan-t5-xl")
     ap.add_argument("--graph_model", default="clip_gt_arxiv_pub")
+    ap.add_argument("--graph_tokenizer_type", default="auto", choices=["auto", "qformer", "perceiver"])
+    ap.add_argument("--perceiver_num_latents", type=int, default=-1, help="<=0 means read from stage3_meta or fallback.")
+    ap.add_argument("--perceiver_num_layers", type=int, default=-1, help="<=0 means read from stage3_meta or fallback.")
+    ap.add_argument("--perceiver_num_heads", type=int, default=-1, help="<=0 means read from stage3_meta or fallback.")
+    ap.add_argument("--perceiver_ff_mult", type=int, default=-1, help="<=0 means read from stage3_meta or fallback.")
+    ap.add_argument("--perceiver_dropout", type=float, default=-1.0, help="<0 means read from stage3_meta or fallback.")
     ap.add_argument("--node_encoder_type", default="auto", choices=["auto", "hybrid", "open_vocab", "legacy_vg"])
     ap.add_argument("--node_encoder_alpha_init", type=float, default=-1.0, help="<0 means read from stage3_meta or fallback.")
     ap.add_argument("--node_encoder_out_dim", type=int, default=0, help="<=0 means read from stage3_meta or fallback 128.")
@@ -68,6 +89,7 @@ def main() -> int:
     stage3_meta = _load_stage3_meta(args.ckpt)
     stage3_node_cfg = stage3_meta.get("node_encoder_config", {}) if isinstance(stage3_meta, dict) else {}
     stage3_arch_cfg = stage3_meta.get("architecture_config", {}) if isinstance(stage3_meta, dict) else {}
+    stage3_graph_cfg = stage3_meta.get("graph_tokenizer_config", {}) if isinstance(stage3_meta, dict) else {}
     resolved_node_encoder_type = (
         str(stage3_node_cfg.get("type", "hybrid"))
         if str(args.node_encoder_type).strip().lower() == "auto"
@@ -93,10 +115,43 @@ def main() -> int:
         if float(args.gvl_adapter_gate_init) < 0
         else float(args.gvl_adapter_gate_init)
     )
+    stage3_graph_cfg = _normalize_graph_tokenizer_config(stage3_graph_cfg if isinstance(stage3_graph_cfg, dict) else {})
+    resolved_graph_tokenizer_type = (
+        str(stage3_graph_cfg.get("type", "qformer"))
+        if str(args.graph_tokenizer_type).strip().lower() == "auto"
+        else str(args.graph_tokenizer_type).strip().lower()
+    )
+    resolved_perceiver_num_latents = (
+        int(stage3_graph_cfg.get("num_latents", 32))
+        if int(args.perceiver_num_latents) <= 0
+        else int(args.perceiver_num_latents)
+    )
+    resolved_perceiver_num_layers = (
+        int(stage3_graph_cfg.get("num_layers", 3))
+        if int(args.perceiver_num_layers) <= 0
+        else int(args.perceiver_num_layers)
+    )
+    resolved_perceiver_num_heads = (
+        int(stage3_graph_cfg.get("num_heads", 8))
+        if int(args.perceiver_num_heads) <= 0
+        else int(args.perceiver_num_heads)
+    )
+    resolved_perceiver_ff_mult = (
+        int(stage3_graph_cfg.get("ff_mult", 4))
+        if int(args.perceiver_ff_mult) <= 0
+        else int(args.perceiver_ff_mult)
+    )
+    resolved_perceiver_dropout = (
+        float(stage3_graph_cfg.get("dropout", 0.0))
+        if float(args.perceiver_dropout) < 0
+        else float(args.perceiver_dropout)
+    )
     print(
         "[Config] "
         f"llm={args.llm} vision={args.vision} node_encoder={resolved_node_encoder_type} "
         f"alpha_init={resolved_node_encoder_alpha} out_dim={resolved_node_encoder_out_dim} "
+        f"graph_tokenizer={resolved_graph_tokenizer_type} "
+        f"perceiver(latents={resolved_perceiver_num_latents},layers={resolved_perceiver_num_layers},heads={resolved_perceiver_num_heads}) "
         f"gvl_adapter={resolved_enable_gvl_adapter} gvl_gate={resolved_gvl_adapter_gate_init}"
     )
 
@@ -149,6 +204,12 @@ def main() -> int:
         enable_vision=True,
         num_obj=int(num_obj),
         num_attr=int(num_attr),
+        graph_tokenizer_type=resolved_graph_tokenizer_type,
+        perceiver_num_latents=int(resolved_perceiver_num_latents),
+        perceiver_num_layers=int(resolved_perceiver_num_layers),
+        perceiver_num_heads=int(resolved_perceiver_num_heads),
+        perceiver_ff_mult=int(resolved_perceiver_ff_mult),
+        perceiver_dropout=float(resolved_perceiver_dropout),
         node_encoder_type=resolved_node_encoder_type,
         node_encoder_alpha_init=resolved_node_encoder_alpha,
         node_encoder_out_dim=resolved_node_encoder_out_dim,

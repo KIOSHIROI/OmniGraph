@@ -88,6 +88,13 @@ VISION_MODEL=${VISION_MODEL:-Salesforce/blip2-flan-t5-xl}
 NODE_ENCODER_TYPE=${NODE_ENCODER_TYPE:-hybrid}
 NODE_ENCODER_ALPHA_INIT=${NODE_ENCODER_ALPHA_INIT:-0.3}
 NODE_ENCODER_OUT_DIM=${NODE_ENCODER_OUT_DIM:-128}
+GRAPH_TOKENIZER_TYPE=${GRAPH_TOKENIZER_TYPE:-perceiver}
+STAGE2A_BOOTSTRAP_MODE=${STAGE2A_BOOTSTRAP_MODE:-no_stage1}
+PERCEIVER_NUM_LATENTS=${PERCEIVER_NUM_LATENTS:-32}
+PERCEIVER_NUM_LAYERS=${PERCEIVER_NUM_LAYERS:-3}
+PERCEIVER_NUM_HEADS=${PERCEIVER_NUM_HEADS:-8}
+PERCEIVER_FF_MULT=${PERCEIVER_FF_MULT:-4}
+PERCEIVER_DROPOUT=${PERCEIVER_DROPOUT:-0.0}
 USE_QA_TYPE_TOKEN=${USE_QA_TYPE_TOKEN:-1}
 ENABLE_GVL_ADAPTER=${ENABLE_GVL_ADAPTER:-1}
 GVL_ADAPTER_GATE_INIT=${GVL_ADAPTER_GATE_INIT:-0.1}
@@ -276,6 +283,15 @@ VG_SCENE_GRAPHS=${VG_SCENE_GRAPHS:-"$REPO/data/vg/contents/sceneGraphs/scene_gra
 VG_REGIONS=${VG_REGIONS:-"$REPO/data/vg/contents/regionDescriptions/region_descriptions.json"}
 VG_IMAGE_ROOT=${VG_IMAGE_ROOT:-"$REPO/data/vg"}
 STAGE1_QFORMER_CKPT=${STAGE1_QFORMER_CKPT:-"$REPO/graph_qformer_stage1.pt"}
+
+STAGE2A_BOOTSTRAP_MODE_LC="$(printf "%s" "$STAGE2A_BOOTSTRAP_MODE" | tr '[:upper:]' '[:lower:]')"
+GRAPH_TOKENIZER_TYPE_LC="$(printf "%s" "$GRAPH_TOKENIZER_TYPE" | tr '[:upper:]' '[:lower:]')"
+REQUIRE_STAGE1_CKPT=0
+if [ "$STAGE2A_BOOTSTRAP_MODE_LC" = "legacy_stage1" ]; then
+  REQUIRE_STAGE1_CKPT=1
+elif [ "$STAGE2A_BOOTSTRAP_MODE_LC" = "auto" ] && [ "$GRAPH_TOKENIZER_TYPE_LC" = "qformer" ]; then
+  REQUIRE_STAGE1_CKPT=1
+fi
 
 STAGE2A_DIR=${STAGE2A_DIR:-"$REPO/checkpoints_projector_vg/stage2A_paper"}
 STAGE2B_DIR=${STAGE2B_DIR:-"$REPO/checkpoints_projector_vg/stage2B_paper"}
@@ -508,6 +524,8 @@ if [ "$AUTO_BATCH_BY_VRAM" = "1" ]; then
 fi
 echo "[Config] LLM_DTYPE=${LLM_DTYPE} LLM_ATTN_IMPL=${LLM_ATTN_IMPL}"
 echo "[Config] NODE_ENCODER_TYPE=${NODE_ENCODER_TYPE} ALPHA=${NODE_ENCODER_ALPHA_INIT} OUT_DIM=${NODE_ENCODER_OUT_DIM}"
+echo "[Config] GRAPH_TOKENIZER_TYPE=${GRAPH_TOKENIZER_TYPE} STAGE2A_BOOTSTRAP_MODE=${STAGE2A_BOOTSTRAP_MODE} REQUIRE_STAGE1_CKPT=${REQUIRE_STAGE1_CKPT}"
+echo "[Config] PERCEIVER latents=${PERCEIVER_NUM_LATENTS} layers=${PERCEIVER_NUM_LAYERS} heads=${PERCEIVER_NUM_HEADS} ff_mult=${PERCEIVER_FF_MULT} dropout=${PERCEIVER_DROPOUT}"
 echo "[Config] QA_TYPE_TOKEN=${USE_QA_TYPE_TOKEN} GVL_ADAPTER=${ENABLE_GVL_ADAPTER} GVL_GATE=${GVL_ADAPTER_GATE_INIT} AUX_HEAD=${ENABLE_GRAPH_AUX_HEAD}"
 echo "[Config] AUX_W: S2A=${S2A_GRAPH_AUX_LOSS_WEIGHT} S2B=${S2B_GRAPH_AUX_LOSS_WEIGHT} S3=${S3_GRAPH_AUX_LOSS_WEIGHT} S2B_R2=${S2B_R2_GRAPH_AUX_LOSS_WEIGHT} S3_R2=${S3_R2_GRAPH_AUX_LOSS_WEIGHT}"
 echo "[Config] ALIGN: ENABLE_XTC=${ENABLE_XTC} ENABLE_XTM=${ENABLE_XTM} SCALE_INIT=${XTC_LOGIT_SCALE_INIT} DUP_THRESH=${XTM_DUP_THRESH}"
@@ -517,7 +535,7 @@ echo "[Config] S2B bs=${S2B_BATCH_SIZE} max_len=${S2B_MAX_LENGTH} workers=${S2B_
 echo "[Config] S3  bs=${S3_BATCH_SIZE} max_len=${S3_MAX_LENGTH} workers=${S3_NUM_WORKERS} prec=${S3_PRECISION}"
 echo "[Config] val: S2A(interval=${S2A_VAL_CHECK_INTERVAL},limit=${S2A_LIMIT_VAL_BATCHES}) S2B(interval=${S2B_VAL_CHECK_INTERVAL},limit=${S2B_LIMIT_VAL_BATCHES}) S3(interval=${S3_VAL_CHECK_INTERVAL},limit=${S3_LIMIT_VAL_BATCHES})"
 echo "[Config] train_node_encoder: S2A=${S2A_TRAIN_NODE_ENCODER} S2B=${S2B_TRAIN_NODE_ENCODER} S3=${S3_TRAIN_NODE_ENCODER} S2B_R2=${S2B_R2_TRAIN_NODE_ENCODER} S3_R2=${S3_R2_TRAIN_NODE_ENCODER}"
-if [ "$RUN_STAGE2A" = "1" ]; then
+if [ "$RUN_STAGE2A" = "1" ] && [ "$REQUIRE_STAGE1_CKPT" = "1" ]; then
   test -f "$STAGE1_QFORMER_CKPT"
 fi
 if [ "$RUN_STAGE2A" = "1" ] || [ "$RUN_STAGE2B" = "1" ] || [ "$RUN_STAGE3" = "1" ]; then
@@ -538,10 +556,16 @@ if [ "$RUN_STAGE2A" = "1" ]; then
   S2A_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_projector.py" \
     --scene_graphs "$VG_SCENE_GRAPHS" \
     --regions "$VG_REGIONS" \
-    --stage1_qformer_ckpt "$STAGE1_QFORMER_CKPT" \
+    --stage2A_bootstrap_mode "$STAGE2A_BOOTSTRAP_MODE" \
     --llm "$LLM_MODEL" \
     --llm_dtype "$LLM_DTYPE" \
     --llm_attn_implementation "$LLM_ATTN_IMPL" \
+    --graph_tokenizer_type "$GRAPH_TOKENIZER_TYPE" \
+    --perceiver_num_latents "$PERCEIVER_NUM_LATENTS" \
+    --perceiver_num_layers "$PERCEIVER_NUM_LAYERS" \
+    --perceiver_num_heads "$PERCEIVER_NUM_HEADS" \
+    --perceiver_ff_mult "$PERCEIVER_FF_MULT" \
+    --perceiver_dropout "$PERCEIVER_DROPOUT" \
     --node_encoder_type "$NODE_ENCODER_TYPE" \
     --node_encoder_alpha_init "$NODE_ENCODER_ALPHA_INIT" \
     --node_encoder_out_dim "$NODE_ENCODER_OUT_DIM" \
@@ -574,6 +598,9 @@ if [ "$RUN_STAGE2A" = "1" ]; then
     --val_check_interval "$S2A_VAL_CHECK_INTERVAL" \
     --limit_val_batches "$S2A_LIMIT_VAL_BATCHES" \
     --save_dir "$STAGE2A_DIR")
+  if [ "$REQUIRE_STAGE1_CKPT" = "1" ]; then
+    S2A_CMD+=(--stage1_qformer_ckpt "$STAGE1_QFORMER_CKPT")
+  fi
   run_with_auto_batch_retry "Stage2A" "S2A_BATCH_SIZE" "${S2A_CMD[@]}"
   resolve_stage2a_ckpt
 elif [ "$RUN_STAGE2B" = "1" ]; then
@@ -589,6 +616,12 @@ if [ "$RUN_STAGE2B" = "1" ]; then
     --llm "$LLM_MODEL" \
     --llm_dtype "$LLM_DTYPE" \
     --llm_attn_implementation "$LLM_ATTN_IMPL" \
+    --graph_tokenizer_type "$GRAPH_TOKENIZER_TYPE" \
+    --perceiver_num_latents "$PERCEIVER_NUM_LATENTS" \
+    --perceiver_num_layers "$PERCEIVER_NUM_LAYERS" \
+    --perceiver_num_heads "$PERCEIVER_NUM_HEADS" \
+    --perceiver_ff_mult "$PERCEIVER_FF_MULT" \
+    --perceiver_dropout "$PERCEIVER_DROPOUT" \
     --node_encoder_type "$NODE_ENCODER_TYPE" \
     --node_encoder_alpha_init "$NODE_ENCODER_ALPHA_INIT" \
     --node_encoder_out_dim "$NODE_ENCODER_OUT_DIM" \
@@ -637,6 +670,12 @@ if [ "$RUN_STAGE3" = "1" ]; then
     --llm "$LLM_MODEL" \
     --llm_dtype "$LLM_DTYPE" \
     --llm_attn_implementation "$LLM_ATTN_IMPL" \
+    --graph_tokenizer_type "$GRAPH_TOKENIZER_TYPE" \
+    --perceiver_num_latents "$PERCEIVER_NUM_LATENTS" \
+    --perceiver_num_layers "$PERCEIVER_NUM_LAYERS" \
+    --perceiver_num_heads "$PERCEIVER_NUM_HEADS" \
+    --perceiver_ff_mult "$PERCEIVER_FF_MULT" \
+    --perceiver_dropout "$PERCEIVER_DROPOUT" \
     --node_encoder_type "$NODE_ENCODER_TYPE" \
     --node_encoder_alpha_init "$NODE_ENCODER_ALPHA_INIT" \
     --node_encoder_out_dim "$NODE_ENCODER_OUT_DIM" \
@@ -706,6 +745,12 @@ echo "[GQA] infer paper run"
   --ckpt "$STAGE3_STATE_DICT" \
   --llm "$LLM_MODEL" \
   --vision "$VISION_MODEL" \
+  --graph_tokenizer_type "$GRAPH_TOKENIZER_TYPE" \
+  --perceiver_num_latents "$PERCEIVER_NUM_LATENTS" \
+  --perceiver_num_layers "$PERCEIVER_NUM_LAYERS" \
+  --perceiver_num_heads "$PERCEIVER_NUM_HEADS" \
+  --perceiver_ff_mult "$PERCEIVER_FF_MULT" \
+  --perceiver_dropout "$PERCEIVER_DROPOUT" \
   --node_encoder_type "$NODE_ENCODER_TYPE" \
   --node_encoder_alpha_init "$NODE_ENCODER_ALPHA_INIT" \
   --node_encoder_out_dim "$NODE_ENCODER_OUT_DIM" \
@@ -816,6 +861,12 @@ S2B_R2_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_stage2B.py" \
   --llm "$LLM_MODEL" \
   --llm_dtype "$LLM_DTYPE" \
   --llm_attn_implementation "$LLM_ATTN_IMPL" \
+  --graph_tokenizer_type "$GRAPH_TOKENIZER_TYPE" \
+  --perceiver_num_latents "$PERCEIVER_NUM_LATENTS" \
+  --perceiver_num_layers "$PERCEIVER_NUM_LAYERS" \
+  --perceiver_num_heads "$PERCEIVER_NUM_HEADS" \
+  --perceiver_ff_mult "$PERCEIVER_FF_MULT" \
+  --perceiver_dropout "$PERCEIVER_DROPOUT" \
   --node_encoder_type "$NODE_ENCODER_TYPE" \
   --node_encoder_alpha_init "$NODE_ENCODER_ALPHA_INIT" \
   --node_encoder_out_dim "$NODE_ENCODER_OUT_DIM" \
@@ -864,6 +915,12 @@ S3_R2_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_stage3.py" \
   --llm "$LLM_MODEL" \
   --llm_dtype "$LLM_DTYPE" \
   --llm_attn_implementation "$LLM_ATTN_IMPL" \
+  --graph_tokenizer_type "$GRAPH_TOKENIZER_TYPE" \
+  --perceiver_num_latents "$PERCEIVER_NUM_LATENTS" \
+  --perceiver_num_layers "$PERCEIVER_NUM_LAYERS" \
+  --perceiver_num_heads "$PERCEIVER_NUM_HEADS" \
+  --perceiver_ff_mult "$PERCEIVER_FF_MULT" \
+  --perceiver_dropout "$PERCEIVER_DROPOUT" \
   --node_encoder_type "$NODE_ENCODER_TYPE" \
   --node_encoder_alpha_init "$NODE_ENCODER_ALPHA_INIT" \
   --node_encoder_out_dim "$NODE_ENCODER_OUT_DIM" \
@@ -907,6 +964,12 @@ run_with_auto_batch_retry "Stage3-R2" "S3_R2_BATCH_SIZE" "${S3_R2_CMD[@]}"
   --ckpt "$STAGE3_R2_STATE_DICT" \
   --llm "$LLM_MODEL" \
   --vision "$VISION_MODEL" \
+  --graph_tokenizer_type "$GRAPH_TOKENIZER_TYPE" \
+  --perceiver_num_latents "$PERCEIVER_NUM_LATENTS" \
+  --perceiver_num_layers "$PERCEIVER_NUM_LAYERS" \
+  --perceiver_num_heads "$PERCEIVER_NUM_HEADS" \
+  --perceiver_ff_mult "$PERCEIVER_FF_MULT" \
+  --perceiver_dropout "$PERCEIVER_DROPOUT" \
   --node_encoder_type "$NODE_ENCODER_TYPE" \
   --node_encoder_alpha_init "$NODE_ENCODER_ALPHA_INIT" \
   --node_encoder_out_dim "$NODE_ENCODER_OUT_DIM" \
