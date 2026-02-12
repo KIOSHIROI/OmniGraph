@@ -49,7 +49,8 @@ class GraphQFormerStage1PL((pl.LightningModule if pl is not None else nn.Module)
         aux_node_text_weight=0.0,
         aux_neigh_text_weight=0.0,
         text_max_len=512,
-        gtm_max_len=768
+        gtm_max_len=768,
+        gtm_text_source="qa",
     ):
         super().__init__()
         if pl is not None:
@@ -60,6 +61,9 @@ class GraphQFormerStage1PL((pl.LightningModule if pl is not None else nn.Module)
         self.aux_neigh_text_weight = aux_neigh_text_weight
         self.text_max_len = text_max_len
         self.gtm_max_len = gtm_max_len
+        self.gtm_text_source = str(gtm_text_source).strip().lower()
+        if self.gtm_text_source not in {"prompt", "answer", "qa"}:
+            self.gtm_text_source = "qa"
         
         # 1. Graph Encoder (Frozen)
         print(f"Loading Graph Encoder: {graph_model_name}")
@@ -168,7 +172,22 @@ class GraphQFormerStage1PL((pl.LightningModule if pl is not None else nn.Module)
         loss_b = F.cross_entropy(logits_b2a, labels)
         return (loss_a + loss_b) / 2
 
-    def forward(self, graph_data, text_input, aux_node_text_input=None, aux_neigh_texts=None):
+    def _build_gtm_texts(self, prompts, answers):
+        prompts = [str(x) if x is not None else "" for x in prompts]
+        answers = [str(x) if x is not None else "" for x in answers]
+        if self.gtm_text_source == "answer":
+            return answers
+        if self.gtm_text_source == "qa":
+            out = []
+            for q, a in zip(prompts, answers):
+                if a:
+                    out.append(f"Question: {q}\nAnswer: {a}")
+                else:
+                    out.append(f"Question: {q}")
+            return out
+        return prompts
+
+    def forward(self, graph_data, text_input, answer_input=None, aux_node_text_input=None, aux_neigh_texts=None):
         """
         graph_data: input for GraphGPT (Batch object or Data object)
         text_input: input list of strings
@@ -297,17 +316,31 @@ class GraphQFormerStage1PL((pl.LightningModule if pl is not None else nn.Module)
 
             if invalid.any():
                 # fallback：对这些样本均匀随机采
-                weights_g2t[invalid] = neg_mask[invalid].float()
-                weights_g2t[invalid] /= weights_g2t[invalid].sum(dim=1, keepdim=True)
+                invalid_idx = invalid.nonzero(as_tuple=True)[0]
+                fallback_mask = neg_mask[invalid].float()
+                for j, ridx in enumerate(invalid_idx.tolist()):
+                    if float(fallback_mask[j].sum().item()) <= 0.0:
+                        fallback_mask[j] = 1.0
+                        fallback_mask[j, ridx] = 0.0
+                weights_g2t[invalid] = fallback_mask
+                weights_g2t[invalid] /= weights_g2t[invalid].sum(dim=1, keepdim=True).clamp_min(1e-12)
 
             neg_text_idx = torch.multinomial(weights_g2t, 1).squeeze(1)
             
         # Tokenize for Q-Former (BERT) - Need separate tokenizer
         # Because Text Encoder might differ from Q-Former's BERT
         # Ensure total length (queries + text) <= Q-Former position limit
+        if isinstance(text_input, list):
+            gtm_text_input = self._build_gtm_texts(
+                prompts=text_input,
+                answers=answer_input if isinstance(answer_input, list) else [""] * len(text_input),
+            )
+        else:
+            gtm_text_input = text_input
+
         max_text_len = self.graph_qformer.config.max_text_len
         qformer_text_tokens = self.qformer_tokenizer(
-            text_input,
+            gtm_text_input,
             padding=True,
             truncation=True,
             max_length=max_text_len,
@@ -346,6 +379,9 @@ class GraphQFormerStage1PL((pl.LightningModule if pl is not None else nn.Module)
         with torch.no_grad():
             gtm_preds = gtm_logits.argmax(dim=1)
             gtm_acc = (gtm_preds == gtm_labels).float().mean()
+            gtm_pred_pos_rate = (gtm_preds == 1).float().mean()
+            gtm_pos_prob_mean = torch.softmax(gtm_logits.float(), dim=1)[:, 1].mean()
+            gtm_logit_margin = (gtm_logits[:, 1].float() - gtm_logits[:, 0].float()).mean()
         
         loss_aux_node = torch.zeros([], device=device)
         loss_aux_neigh = torch.zeros([], device=device)
@@ -376,6 +412,9 @@ class GraphQFormerStage1PL((pl.LightningModule if pl is not None else nn.Module)
             "loss_gtc": loss_gtc,
             "loss_gtm": loss_gtm,
             "acc_gtm": gtm_acc,
+            "gtm_pred_pos_rate": gtm_pred_pos_rate,
+            "gtm_pos_prob_mean": gtm_pos_prob_mean,
+            "gtm_logit_margin": gtm_logit_margin,
             "loss_aux_node": loss_aux_node,
             "loss_aux_neigh": loss_aux_neigh
         }
@@ -385,10 +424,17 @@ class GraphQFormerStage1PL((pl.LightningModule if pl is not None else nn.Module)
             raise RuntimeError("pytorch_lightning is required for training_step")
         graph_data = batch['graph_data']
         text_input = batch['text_input']
+        answer_input = batch.get('answer_input', None)
         aux_node_text_input = batch.get('aux_node_text_input', None)
         aux_neigh_texts = batch.get('aux_neigh_texts', None)
         
-        outputs = self(graph_data, text_input, aux_node_text_input=aux_node_text_input, aux_neigh_texts=aux_neigh_texts)
+        outputs = self(
+            graph_data,
+            text_input,
+            answer_input=answer_input,
+            aux_node_text_input=aux_node_text_input,
+            aux_neigh_texts=aux_neigh_texts,
+        )
         loss = outputs['loss']
         
         # Logging
@@ -396,6 +442,9 @@ class GraphQFormerStage1PL((pl.LightningModule if pl is not None else nn.Module)
         self.log("train_loss_gtm", outputs['loss_gtm'], prog_bar=True, on_step=True, on_epoch=True, batch_size=len(text_input))
         self.log("train_acc_gtm", outputs['acc_gtm'], prog_bar=True, on_step=True, on_epoch=True, batch_size=len(text_input))
         self.log("train_loss_gtc", outputs['loss_gtc'], prog_bar=True, on_step=True, on_epoch=True, batch_size=len(text_input))
+        self.log("train_gtm_pred_pos_rate", outputs['gtm_pred_pos_rate'], prog_bar=False, on_step=True, on_epoch=True, batch_size=len(text_input))
+        self.log("train_gtm_pos_prob_mean", outputs['gtm_pos_prob_mean'], prog_bar=False, on_step=True, on_epoch=True, batch_size=len(text_input))
+        self.log("train_gtm_logit_margin", outputs['gtm_logit_margin'], prog_bar=False, on_step=True, on_epoch=True, batch_size=len(text_input))
         if self.aux_node_text_weight > 0:
             self.log("train_loss_aux_node", outputs['loss_aux_node'], prog_bar=True, on_step=True, on_epoch=True, batch_size=len(text_input))
         if self.aux_neigh_text_weight > 0:
@@ -604,6 +653,8 @@ def main():
     parser.add_argument("--text_model_name", type=str, default="sentence-transformers/all-mpnet-base-v2")
     parser.add_argument("--text_max_len", type=int, default=512)
     parser.add_argument("--gtm_max_len", type=int, default=512)
+    parser.add_argument("--gtm_text_source", type=str, default="qa", choices=["prompt", "answer", "qa"],
+                        help="Text source for GTM matching head.")
     parser.add_argument("--max_steps", type=int, default=-1, help="If >0, hard stop after this many optimizer steps.")
     parser.add_argument("--enable_early_stop", type=int, default=1, choices=[0, 1], help="Enable early stopping on train_loss_epoch.")
     parser.add_argument("--early_stop_patience", type=int, default=2, help="Early stop patience in epochs.")
@@ -647,7 +698,8 @@ def main():
         aux_neigh_text_weight=args.aux_neigh_text_weight,
         text_model_name=args.text_model_name,
         text_max_len=args.text_max_len,
-        gtm_max_len=args.gtm_max_len
+        gtm_max_len=args.gtm_max_len,
+        gtm_text_source=str(args.gtm_text_source),
     )
 
     if pl is not None:

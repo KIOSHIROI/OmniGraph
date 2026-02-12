@@ -30,6 +30,7 @@ Optional Stage1 stop controls:
 ```bash
 ./train_infra.sh --profile 4090 --mode stage1 --gpu 0 \
   --set STAGE1_MAX_STEPS=20000 \
+  --set STAGE1_GTM_TEXT_SOURCE=qa \
   --set STAGE1_ENABLE_EARLY_STOP=1 \
   --set STAGE1_EARLY_STOP_PATIENCE=2 \
   --set STAGE1_EARLY_STOP_MIN_DELTA=0.001
