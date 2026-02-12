@@ -656,6 +656,13 @@ def main():
         if repeat > 1 and len(qa_records) > 0:
             qa_records = qa_records * repeat
         print(f"[GraphQA] synthetic_pairs={len(qa_records)} (repeat={repeat})")
+        if qa_records:
+            type_counts: Dict[str, int] = {}
+            for rec in qa_records:
+                qa_type = str(rec.get("qa_type", "unknown"))
+                type_counts[qa_type] = type_counts.get(qa_type, 0) + 1
+            summary = ", ".join(f"{k}:{type_counts[k]}" for k in sorted(type_counts.keys()))
+            print(f"[GraphQA] type_dist={summary}")
     else:
         print("[GraphQA] disabled.")
 
