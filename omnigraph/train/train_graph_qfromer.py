@@ -30,6 +30,7 @@ import json
 import copy
 import time
 import argparse
+import hashlib
 
 import random
 random.seed(42)
@@ -52,6 +53,13 @@ class GraphQFormerStage1PL((pl.LightningModule if pl is not None else nn.Module)
         text_max_len=512,
         gtm_max_len=768,
         gtm_text_source="qa",
+        gtc_loss_weight=1.0,
+        gtm_loss_weight=1.2,
+        gtm_warmup_steps=1000,
+        gtm_negatives_per_pos=2,
+        gtm_text_dup_thresh=0.98,
+        gtm_use_hard_negative=True,
+        gtm_label_smoothing=0.0,
     ):
         super().__init__()
         if pl is not None:
@@ -65,6 +73,13 @@ class GraphQFormerStage1PL((pl.LightningModule if pl is not None else nn.Module)
         self.gtm_text_source = str(gtm_text_source).strip().lower()
         if self.gtm_text_source not in {"prompt", "answer", "qa"}:
             self.gtm_text_source = "qa"
+        self.gtc_loss_weight = float(gtc_loss_weight)
+        self.gtm_loss_weight = float(gtm_loss_weight)
+        self.gtm_warmup_steps = max(int(gtm_warmup_steps), 0)
+        self.gtm_negatives_per_pos = max(int(gtm_negatives_per_pos), 1)
+        self.gtm_text_dup_thresh = float(gtm_text_dup_thresh)
+        self.gtm_use_hard_negative = bool(gtm_use_hard_negative)
+        self.gtm_label_smoothing = max(float(gtm_label_smoothing), 0.0)
         
         # 1. Graph Encoder (Frozen)
         print(f"Loading Graph Encoder: {graph_model_name}")
@@ -188,7 +203,26 @@ class GraphQFormerStage1PL((pl.LightningModule if pl is not None else nn.Module)
             return out
         return prompts
 
-    def forward(self, graph_data, text_input, answer_input=None, aux_node_text_input=None, aux_neigh_texts=None):
+    def _current_gtm_weight(self):
+        if self.gtm_warmup_steps <= 0:
+            return self.gtm_loss_weight
+        step = int(self.global_step) if hasattr(self, "global_step") else 0
+        scale = min(1.0, float(step + 1) / float(self.gtm_warmup_steps))
+        return self.gtm_loss_weight * scale
+
+    @staticmethod
+    def _normalize_text_for_dup(s: str) -> str:
+        return " ".join(str(s).strip().lower().split())
+
+    def forward(
+        self,
+        graph_data,
+        text_input,
+        answer_input=None,
+        aux_node_text_input=None,
+        aux_neigh_texts=None,
+        graph_group_ids=None,
+    ):
         """
         graph_data: input for GraphGPT (Batch object or Data object)
         text_input: input list of strings
@@ -277,57 +311,8 @@ class GraphQFormerStage1PL((pl.LightningModule if pl is not None else nn.Module)
             logits_g2t = torch.nan_to_num(logits_g2t, nan=0.0, posinf=0.0, neginf=0.0)
 
         batch_size = logits_g2t.shape[0]
-        labels = torch.arange(batch_size, device=device)
         loss_gtc = self._clip_contrastive_loss(graph_feat, text_feat, logit_scale)
-        
-        # --- GTM (Graph-Text Matching) Loss ---
-        # Select hard negatives or random negatives
-        # Compute logits just for mining (without optimization)
 
-        with torch.no_grad():
-            # logits_g2t: (B, B)
-            B = logits_g2t.size(0)
-
-            # 构造 mask：不能采自己
-            neg_mask = torch.ones_like(logits_g2t, dtype=torch.bool)
-            neg_mask.fill_diagonal_(False)
-
-            # --- 关键修正：过滤掉文本内容相同/极相似的负样本 ---
-            # 如果 batch 中存在多张图对应相同的文本（或极相似文本），
-            # GTC 会将它们拉近，Hard Negative Mining 可能会选中它们作为负样本。
-            # 但这对 GTM 来说是 "False Negative"（标签是负，内容是正），导致 Loss 无法下降。
-            with torch.no_grad():
-                text_sim = text_feat @ text_feat.t()
-                # 阈值设为 0.98，过滤掉几乎一样的文本
-                is_duplicate_text = text_sim > 0.98
-                # 从 neg_mask 中去除这些重复文本对
-                neg_mask = neg_mask & (~is_duplicate_text)
-
-            # 在 logits 层面 mask
-            masked_logits = logits_g2t.float().masked_fill(~neg_mask, -1e9)
-
-            # softmax（强制 fp32，避免 half underflow）
-            weights_g2t = F.softmax(masked_logits, dim=1)
-
-            # 行和检查（非常重要）
-            row_sum = weights_g2t.sum(dim=1)
-
-            # 找到“没有任何负样本”的 graph
-            invalid = row_sum <= 1e-6
-
-            if invalid.any():
-                # fallback：对这些样本均匀随机采
-                invalid_idx = invalid.nonzero(as_tuple=True)[0]
-                fallback_mask = neg_mask[invalid].float()
-                for j, ridx in enumerate(invalid_idx.tolist()):
-                    if float(fallback_mask[j].sum().item()) <= 0.0:
-                        fallback_mask[j] = 1.0
-                        fallback_mask[j, ridx] = 0.0
-                weights_g2t[invalid] = fallback_mask
-                weights_g2t[invalid] /= weights_g2t[invalid].sum(dim=1, keepdim=True).clamp_min(1e-12)
-
-            neg_text_idx = torch.multinomial(weights_g2t, 1).squeeze(1)
-            
         # Tokenize for Q-Former (BERT) - Need separate tokenizer
         # Because Text Encoder might differ from Q-Former's BERT
         # Ensure total length (queries + text) <= Q-Former position limit
@@ -347,42 +332,140 @@ class GraphQFormerStage1PL((pl.LightningModule if pl is not None else nn.Module)
             max_length=max_text_len,
             return_tensors="pt"
         ).to(device)
-        
+
         pos_text_ids = qformer_text_tokens.input_ids
         pos_text_att = qformer_text_tokens.attention_mask
-        
-        neg_text_ids = pos_text_ids[neg_text_idx]
-        neg_text_att = pos_text_att[neg_text_idx]
-        
-        # Concat Positive and Negative
-        # [Pos, Neg]
-        total_text_ids = torch.cat([pos_text_ids, neg_text_ids], dim=0)
-        total_text_att = torch.cat([pos_text_att, neg_text_att], dim=0)
-        
-        # Double Graph inputs
-        total_graph_states = torch.cat([graph_hidden_states, graph_hidden_states], dim=0)
-        total_graph_mask = torch.cat([graph_attention_mask, graph_attention_mask], dim=0)
-        
-        # Labels: 1 for pos, 0 for neg
-        gtm_labels = torch.cat([torch.ones(batch_size), torch.zeros(batch_size)]).long().to(device)
-        
-        # Forward GTM
-        gtm_logits = self.graph_qformer.forward_match(
-            total_graph_states,
-            total_graph_mask,
-            total_text_ids,
-            total_text_att
-        )
-        
-        loss_gtm = F.cross_entropy(gtm_logits, gtm_labels)
 
-        # 计算 GTM Accuracy 用于监控
-        with torch.no_grad():
-            gtm_preds = gtm_logits.argmax(dim=1)
-            gtm_acc = (gtm_preds == gtm_labels).float().mean()
-            gtm_pred_pos_rate = (gtm_preds == 1).float().mean()
-            gtm_pos_prob_mean = torch.softmax(gtm_logits.float(), dim=1)[:, 1].mean()
-            gtm_logit_margin = (gtm_logits[:, 1].float() - gtm_logits[:, 0].float()).mean()
+        B = logits_g2t.size(0)
+        gtm_valid_neg_ratio = torch.ones([], device=device)
+        gtm_fallback_row_ratio = torch.zeros([], device=device)
+        gtm_weight = torch.tensor(self._current_gtm_weight(), device=device)
+
+        if B < 2:
+            # In-batch negatives require at least 2 samples.
+            loss_gtm = torch.zeros([], device=device)
+            gtm_acc = torch.full([], 0.5, device=device)
+            gtm_pos_acc = torch.full([], 0.5, device=device)
+            gtm_neg_acc = torch.full([], 0.5, device=device)
+            gtm_pred_pos_rate = torch.full([], 0.5, device=device)
+            gtm_pos_prob_mean = torch.full([], 0.5, device=device)
+            gtm_logit_margin = torch.zeros([], device=device)
+            gtm_pos_logit_margin = torch.zeros([], device=device)
+            gtm_neg_logit_margin = torch.zeros([], device=device)
+        else:
+            with torch.no_grad():
+                neg_mask = torch.ones_like(logits_g2t, dtype=torch.bool)
+                neg_mask.fill_diagonal_(False)
+
+                if isinstance(graph_group_ids, list) and len(graph_group_ids) == B:
+                    gg = [str(x) for x in graph_group_ids]
+                    same_graph = torch.tensor(
+                        [[gg[i] == gg[j] for j in range(B)] for i in range(B)],
+                        device=device,
+                        dtype=torch.bool,
+                    )
+                    neg_mask = neg_mask & (~same_graph)
+
+                if isinstance(gtm_text_input, list):
+                    norm_text = [self._normalize_text_for_dup(t) for t in gtm_text_input]
+                    exact_dup = torch.tensor(
+                        [[norm_text[i] == norm_text[j] for j in range(B)] for i in range(B)],
+                        device=device,
+                        dtype=torch.bool,
+                    )
+                    neg_mask = neg_mask & (~exact_dup)
+
+                if self.gtm_text_dup_thresh > 0:
+                    text_sim = text_feat.float() @ text_feat.float().t()
+                    is_duplicate_text = text_sim > float(self.gtm_text_dup_thresh)
+                    neg_mask = neg_mask & (~is_duplicate_text)
+
+                neg_mask.fill_diagonal_(False)
+                gtm_valid_neg_ratio = neg_mask.float().sum() / float(max(B * (B - 1), 1))
+
+                if self.gtm_use_hard_negative:
+                    masked_logits = logits_g2t.float().masked_fill(~neg_mask, -1e9)
+                    weights_g2t = F.softmax(masked_logits, dim=1)
+                else:
+                    weights_g2t = neg_mask.float()
+
+                row_sum = weights_g2t.sum(dim=1)
+                invalid = row_sum <= 1e-6
+                gtm_fallback_row_ratio = invalid.float().mean()
+
+                if invalid.any():
+                    invalid_idx = invalid.nonzero(as_tuple=True)[0]
+                    fallback_mask = torch.zeros_like(weights_g2t[invalid], dtype=torch.float32)
+                    for j, ridx in enumerate(invalid_idx.tolist()):
+                        constrained_row = neg_mask[ridx].float()
+                        if float(constrained_row.sum().item()) > 0.0:
+                            fallback_mask[j] = constrained_row
+                        else:
+                            fallback_mask[j] = 1.0
+                            fallback_mask[j, ridx] = 0.0
+                    fallback_mask = fallback_mask / fallback_mask.sum(dim=1, keepdim=True).clamp_min(1e-12)
+                    weights_g2t[invalid] = fallback_mask
+
+                weights_g2t = weights_g2t / weights_g2t.sum(dim=1, keepdim=True).clamp_min(1e-12)
+                neg_text_idx = torch.multinomial(weights_g2t, self.gtm_negatives_per_pos, replacement=True)
+
+            neg_flat_idx = neg_text_idx.reshape(-1)
+            neg_text_ids = pos_text_ids[neg_flat_idx]
+            neg_text_att = pos_text_att[neg_flat_idx]
+
+            K = self.gtm_negatives_per_pos
+            neg_graph_states = graph_hidden_states.unsqueeze(1).expand(-1, K, -1, -1)
+            neg_graph_states = neg_graph_states.reshape(B * K, graph_hidden_states.size(1), graph_hidden_states.size(2))
+            neg_graph_mask = graph_attention_mask.unsqueeze(1).expand(-1, K, -1).reshape(B * K, graph_attention_mask.size(1))
+
+            total_text_ids = torch.cat([pos_text_ids, neg_text_ids], dim=0)
+            total_text_att = torch.cat([pos_text_att, neg_text_att], dim=0)
+            total_graph_states = torch.cat([graph_hidden_states, neg_graph_states], dim=0)
+            total_graph_mask = torch.cat([graph_attention_mask, neg_graph_mask], dim=0)
+
+            gtm_labels = torch.cat(
+                [
+                    torch.ones(B, device=device, dtype=torch.long),
+                    torch.zeros(B * K, device=device, dtype=torch.long),
+                ],
+                dim=0,
+            )
+
+            gtm_logits = self.graph_qformer.forward_match(
+                total_graph_states,
+                total_graph_mask,
+                total_text_ids,
+                total_text_att
+            )
+
+            num_pos = float(B)
+            num_neg = float(B * K)
+            class_weights = torch.tensor(
+                [
+                    (num_pos + num_neg) / (2.0 * num_neg),
+                    (num_pos + num_neg) / (2.0 * num_pos),
+                ],
+                device=device,
+                dtype=gtm_logits.dtype,
+            )
+            loss_gtm = F.cross_entropy(
+                gtm_logits,
+                gtm_labels,
+                weight=class_weights,
+                label_smoothing=float(self.gtm_label_smoothing),
+            )
+
+            with torch.no_grad():
+                gtm_preds = gtm_logits.argmax(dim=1)
+                gtm_probs = torch.softmax(gtm_logits.float(), dim=1)
+                gtm_acc = (gtm_preds == gtm_labels).float().mean()
+                gtm_pos_acc = (gtm_preds[:B] == 1).float().mean()
+                gtm_neg_acc = (gtm_preds[B:] == 0).float().mean()
+                gtm_pred_pos_rate = (gtm_preds == 1).float().mean()
+                gtm_pos_prob_mean = gtm_probs[:, 1].mean()
+                gtm_logit_margin = (gtm_logits[:, 1].float() - gtm_logits[:, 0].float()).mean()
+                gtm_pos_logit_margin = (gtm_logits[:B, 1].float() - gtm_logits[:B, 0].float()).mean()
+                gtm_neg_logit_margin = (gtm_logits[B:, 0].float() - gtm_logits[B:, 1].float()).mean()
         
         loss_aux_node = torch.zeros([], device=device)
         loss_aux_neigh = torch.zeros([], device=device)
@@ -406,16 +489,28 @@ class GraphQFormerStage1PL((pl.LightningModule if pl is not None else nn.Module)
                 graph_feat_valid = graph_feat[torch.tensor(valid_indices, device=device)]
                 loss_aux_neigh = self._clip_contrastive_loss(graph_feat_valid, neigh_feat, logit_scale)
         
-        loss = loss_gtc + loss_gtm + self.aux_node_text_weight * loss_aux_node + self.aux_neigh_text_weight * loss_aux_neigh
+        loss = (
+            self.gtc_loss_weight * loss_gtc
+            + gtm_weight * loss_gtm
+            + self.aux_node_text_weight * loss_aux_node
+            + self.aux_neigh_text_weight * loss_aux_neigh
+        )
         
         return {
             "loss": loss,
             "loss_gtc": loss_gtc,
             "loss_gtm": loss_gtm,
             "acc_gtm": gtm_acc,
+            "gtm_pos_acc": gtm_pos_acc,
+            "gtm_neg_acc": gtm_neg_acc,
             "gtm_pred_pos_rate": gtm_pred_pos_rate,
             "gtm_pos_prob_mean": gtm_pos_prob_mean,
             "gtm_logit_margin": gtm_logit_margin,
+            "gtm_pos_logit_margin": gtm_pos_logit_margin,
+            "gtm_neg_logit_margin": gtm_neg_logit_margin,
+            "gtm_valid_neg_ratio": gtm_valid_neg_ratio,
+            "gtm_fallback_row_ratio": gtm_fallback_row_ratio,
+            "gtm_weight": gtm_weight,
             "loss_aux_node": loss_aux_node,
             "loss_aux_neigh": loss_aux_neigh
         }
@@ -428,6 +523,7 @@ class GraphQFormerStage1PL((pl.LightningModule if pl is not None else nn.Module)
         answer_input = batch.get('answer_input', None)
         aux_node_text_input = batch.get('aux_node_text_input', None)
         aux_neigh_texts = batch.get('aux_neigh_texts', None)
+        graph_group_ids = batch.get('graph_group_ids', None)
         
         outputs = self(
             graph_data,
@@ -435,6 +531,7 @@ class GraphQFormerStage1PL((pl.LightningModule if pl is not None else nn.Module)
             answer_input=answer_input,
             aux_node_text_input=aux_node_text_input,
             aux_neigh_texts=aux_neigh_texts,
+            graph_group_ids=graph_group_ids,
         )
         loss = outputs['loss']
         
@@ -442,10 +539,17 @@ class GraphQFormerStage1PL((pl.LightningModule if pl is not None else nn.Module)
         self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=len(text_input))
         self.log("train_loss_gtm", outputs['loss_gtm'], prog_bar=True, on_step=True, on_epoch=True, batch_size=len(text_input))
         self.log("train_acc_gtm", outputs['acc_gtm'], prog_bar=True, on_step=True, on_epoch=True, batch_size=len(text_input))
+        self.log("train_gtm_pos_acc", outputs['gtm_pos_acc'], prog_bar=False, on_step=True, on_epoch=True, batch_size=len(text_input))
+        self.log("train_gtm_neg_acc", outputs['gtm_neg_acc'], prog_bar=False, on_step=True, on_epoch=True, batch_size=len(text_input))
         self.log("train_loss_gtc", outputs['loss_gtc'], prog_bar=True, on_step=True, on_epoch=True, batch_size=len(text_input))
         self.log("train_gtm_pred_pos_rate", outputs['gtm_pred_pos_rate'], prog_bar=False, on_step=True, on_epoch=True, batch_size=len(text_input))
         self.log("train_gtm_pos_prob_mean", outputs['gtm_pos_prob_mean'], prog_bar=False, on_step=True, on_epoch=True, batch_size=len(text_input))
         self.log("train_gtm_logit_margin", outputs['gtm_logit_margin'], prog_bar=False, on_step=True, on_epoch=True, batch_size=len(text_input))
+        self.log("train_gtm_pos_logit_margin", outputs['gtm_pos_logit_margin'], prog_bar=False, on_step=True, on_epoch=True, batch_size=len(text_input))
+        self.log("train_gtm_neg_logit_margin", outputs['gtm_neg_logit_margin'], prog_bar=False, on_step=True, on_epoch=True, batch_size=len(text_input))
+        self.log("train_gtm_valid_neg_ratio", outputs['gtm_valid_neg_ratio'], prog_bar=False, on_step=True, on_epoch=True, batch_size=len(text_input))
+        self.log("train_gtm_fallback_row_ratio", outputs['gtm_fallback_row_ratio'], prog_bar=False, on_step=True, on_epoch=True, batch_size=len(text_input))
+        self.log("train_gtm_weight", outputs['gtm_weight'], prog_bar=False, on_step=True, on_epoch=True, batch_size=len(text_input))
         if self.aux_node_text_weight > 0:
             self.log("train_loss_aux_node", outputs['loss_aux_node'], prog_bar=True, on_step=True, on_epoch=True, batch_size=len(text_input))
         if self.aux_neigh_text_weight > 0:
@@ -535,6 +639,7 @@ class GraphTextDataset(Dataset):
         graph_data = item['graph']
         node_list = graph_data.get('node_list', [])
         edge_index = graph_data.get('edge_index', [[], []])
+        explicit_graph_group_id = item.get("graph_id", None) or graph_data.get("graph_id", None)
         
         # Get features
         sample_id = item.get('id', 'arxiv_unknown')
@@ -552,6 +657,24 @@ class GraphTextDataset(Dataset):
              graph_node = torch.randn(len(node_list), 128)
         
         edge_index_tensor = torch.tensor(edge_index, dtype=torch.long)
+
+        if explicit_graph_group_id is not None:
+            graph_group_id = str(explicit_graph_group_id)
+        else:
+            edge_src = edge_index[0] if isinstance(edge_index, list) and len(edge_index) > 0 else []
+            edge_dst = edge_index[1] if isinstance(edge_index, list) and len(edge_index) > 1 else []
+            edge_pairs = []
+            max_edges_for_hash = min(len(edge_src), len(edge_dst), 128)
+            for i in range(max_edges_for_hash):
+                edge_pairs.append(f"{edge_src[i]}-{edge_dst[i]}")
+            hash_material = "|".join([
+                str(graph_type),
+                f"n={len(node_list)}",
+                f"e={len(edge_src)}",
+                ",".join(map(str, node_list[:128])),
+                ",".join(edge_pairs),
+            ])
+            graph_group_id = hashlib.sha1(hash_material.encode("utf-8")).hexdigest()[:16]
         
         # Create Data object
         # User fix: use standard key 'x' for PyG compatibility, and alias 'graph_node' for clip_graph.py
@@ -607,7 +730,8 @@ class GraphTextDataset(Dataset):
             "text": text_content,
             "answer": answer_content,
             "aux_node_text": aux_node_text,
-            "aux_neigh_texts": aux_neigh_texts
+            "aux_neigh_texts": aux_neigh_texts,
+            "graph_group_id": graph_group_id,
         }
 
 def collate_fn(batch):
@@ -617,6 +741,7 @@ def collate_fn(batch):
     
     texts = [item['text'] for item in batch]
     answers = [item.get('answer', '') for item in batch]
+    graph_group_ids = [item.get('graph_group_id', '') for item in batch]
     aux_node_text_input = [item.get('aux_node_text', None) for item in batch]
     aux_neigh_texts = [item.get('aux_neigh_texts', None) for item in batch]
     
@@ -629,6 +754,7 @@ def collate_fn(batch):
         "graph_data": batch_graph,
         "text_input": texts,
         "answer_input": answers,
+        "graph_group_ids": graph_group_ids,
         "aux_node_text_input": aux_node_text_input,
         "aux_neigh_texts": aux_neigh_texts
     }
@@ -656,6 +782,13 @@ def main():
     parser.add_argument("--gtm_max_len", type=int, default=512)
     parser.add_argument("--gtm_text_source", type=str, default="qa", choices=["prompt", "answer", "qa"],
                         help="Text source for GTM matching head.")
+    parser.add_argument("--gtc_loss_weight", type=float, default=1.0, help="Weight for GTC contrastive loss.")
+    parser.add_argument("--gtm_loss_weight", type=float, default=1.2, help="Base weight for GTM loss.")
+    parser.add_argument("--gtm_warmup_steps", type=int, default=1000, help="Linear warmup steps for GTM loss weight.")
+    parser.add_argument("--gtm_negatives_per_pos", type=int, default=2, help="Number of negatives sampled per positive GTM pair.")
+    parser.add_argument("--gtm_text_dup_thresh", type=float, default=0.98, help="Cosine similarity threshold to filter duplicate text negatives.")
+    parser.add_argument("--gtm_use_hard_negative", type=int, default=1, choices=[0, 1], help="Use hard-negative sampling from GTC logits.")
+    parser.add_argument("--gtm_label_smoothing", type=float, default=0.0, help="Label smoothing for GTM CE loss.")
     parser.add_argument("--max_steps", type=int, default=-1, help="If >0, hard stop after this many optimizer steps.")
     parser.add_argument("--enable_early_stop", type=int, default=1, choices=[0, 1], help="Enable early stopping on train_loss_epoch.")
     parser.add_argument("--early_stop_patience", type=int, default=2, help="Early stop patience in epochs.")
@@ -664,6 +797,12 @@ def main():
     args = parser.parse_args()
 
     setup_env(hf_endpoint=args.hf_endpoint, hf_cache_dir=args.hf_cache_dir)
+    print(
+        "[Stage1][GTM] "
+        f"text_source={args.gtm_text_source} neg_per_pos={args.gtm_negatives_per_pos} "
+        f"hard_neg={args.gtm_use_hard_negative} dup_thresh={args.gtm_text_dup_thresh} "
+        f"gtc_w={args.gtc_loss_weight} gtm_w={args.gtm_loss_weight} warmup={args.gtm_warmup_steps}"
+    )
     
     BATCH_SIZE = args.batch_size
     LR = args.lr
@@ -701,6 +840,13 @@ def main():
         text_max_len=args.text_max_len,
         gtm_max_len=args.gtm_max_len,
         gtm_text_source=str(args.gtm_text_source),
+        gtc_loss_weight=float(args.gtc_loss_weight),
+        gtm_loss_weight=float(args.gtm_loss_weight),
+        gtm_warmup_steps=int(args.gtm_warmup_steps),
+        gtm_negatives_per_pos=int(args.gtm_negatives_per_pos),
+        gtm_text_dup_thresh=float(args.gtm_text_dup_thresh),
+        gtm_use_hard_negative=bool(int(args.gtm_use_hard_negative)),
+        gtm_label_smoothing=float(args.gtm_label_smoothing),
     )
 
     if pl is not None:
@@ -756,9 +902,18 @@ def main():
             for batch_idx, batch in enumerate(dataloader):
                 graph_data = batch["graph_data"].to(device)
                 text_input = batch["text_input"]
+                answer_input = batch.get("answer_input", None)
+                graph_group_ids = batch.get("graph_group_ids", None)
                 aux_node_text_input = batch.get("aux_node_text_input", None)
                 aux_neigh_texts = batch.get("aux_neigh_texts", None)
-                out = model(graph_data, text_input, aux_node_text_input=aux_node_text_input, aux_neigh_texts=aux_neigh_texts)
+                out = model(
+                    graph_data,
+                    text_input,
+                    answer_input=answer_input,
+                    aux_node_text_input=aux_node_text_input,
+                    aux_neigh_texts=aux_neigh_texts,
+                    graph_group_ids=graph_group_ids,
+                )
                 loss = out["loss"]
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
