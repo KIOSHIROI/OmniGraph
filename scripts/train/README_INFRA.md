@@ -1,28 +1,36 @@
 # OmniGraph Standardized Infra Launcher
 
-Use this launcher to run reproducible training/eval with profile + manifest logging.
-Default strict path is now `Stage2A(no_stage1 + perceiver) -> Stage2B -> Stage3 -> GQA eval`.
+Use this launcher to run reproducible training/eval with profile inheritance, manifest logging, and resumable runs.
+Default strict path is now `graph_bootstrap(no_stage1 + perceiver) -> graph_refine -> multimodal_tune -> GQA eval`.
 
 ## Entry
 
 ```bash
 python scripts/train/infra_launcher.py --profile 4090 --mode full --gpu 0
+python scripts/train/infra_launcher.py --profile pro6000 --mode full --gpu 0
+```
+
+List and validate profiles:
+
+```bash
+python scripts/train/infra_launcher.py --list-profiles
+python scripts/train/infra_launcher.py --profile 4090 --validate-only
 ```
 
 ## Common modes
 
 ```bash
-python scripts/train/infra_launcher.py --profile 4090 --mode stage1 --gpu 0
-python scripts/train/infra_launcher.py --profile 4090 --mode stage2a --gpu 0
-python scripts/train/infra_launcher.py --profile 4090 --mode stage2b --gpu 0
-python scripts/train/infra_launcher.py --profile 4090 --mode stage3 --gpu 0
-python scripts/train/infra_launcher.py --profile 4090 --mode eval   --gpu 0
+python scripts/train/infra_launcher.py --profile 4090 --mode graph_tokenizer_pretrain --gpu 0
+python scripts/train/infra_launcher.py --profile 4090 --mode graph_bootstrap --gpu 0
+python scripts/train/infra_launcher.py --profile 4090 --mode graph_refine --gpu 0
+python scripts/train/infra_launcher.py --profile 4090 --mode multimodal_tune --gpu 0
+python scripts/train/infra_launcher.py --profile 4090 --mode evaluation --gpu 0
 ```
 
 Legacy rollback (Stage1 + QFormer):
 
 ```bash
-./train_infra.sh --profile 4090 --mode stage2a --gpu 0 \
+./train_infra.sh --profile 4090 --mode graph_bootstrap --gpu 0 \
   --set GRAPH_TOKENIZER_TYPE=qformer \
   --set STAGE2A_BOOTSTRAP_MODE=legacy_stage1 \
   --set STAGE1_QFORMER_CKPT=/absolute/path/to/runs/<run_id>/checkpoints/graph_qformer_stage1.pt
@@ -31,7 +39,7 @@ Legacy rollback (Stage1 + QFormer):
 Optional Stage1 stop controls (legacy path only):
 
 ```bash
-./train_infra.sh --profile 4090 --mode stage1 --gpu 0 \
+./train_infra.sh --profile 4090 --mode graph_tokenizer_pretrain --gpu 0 \
   --set STAGE1_MAX_STEPS=20000 \
   --set STAGE1_GTM_TEXT_SOURCE=qa \
   --set STAGE1_GTM_NEG_PER_POS=2 \
@@ -52,6 +60,41 @@ python scripts/train/infra_launcher.py \
   --set AUTO_BATCH_SCALE=1.2
 ```
 
+Mid-run OOM auto recovery (reduce batch + resume from latest checkpoint):
+
+```bash
+python scripts/train/infra_launcher.py --profile 4090 --mode full --gpu 0 \
+  --set AUTO_RESUME_ON_OOM=1 \
+  --set AUTO_BATCH_RETRY_ON_OOM=1 \
+  --set S2A_CHECKPOINT_EVERY_N_STEPS=1000 \
+  --set S2B_CHECKPOINT_EVERY_N_STEPS=1000 \
+  --set S3_CHECKPOINT_EVERY_N_STEPS=1000
+```
+
+Print fully resolved env (profile + paths + overrides):
+
+```bash
+python scripts/train/infra_launcher.py --profile 4090 --mode full --print-resolved-env --dry-run
+```
+
+Resume an existing run directory:
+
+```bash
+python scripts/train/infra_launcher.py --profile 4090 --mode graph_refine --run-id my_exp_001 --resume --gpu 0
+```
+
+Require clean git state for strict reproducibility:
+
+```bash
+python scripts/train/infra_launcher.py --profile 4090 --mode full --require-clean-git --gpu 0
+```
+
+Run CLI contract preflight before launching:
+
+```bash
+python scripts/train/infra_launcher.py --profile 4090 --mode full --preflight --gpu 0
+```
+
 ## Dry run
 
 ```bash
@@ -65,3 +108,17 @@ Each run creates `runs/<run_id>/` containing:
 - `command.sh`: exact command
 - `run.log`: merged stdout/stderr
 - `run_status.json`: return code + timestamps
+- `resolved_env.sh`: export-able env snapshot for exact replay
+
+When `--resume` is used:
+- `run_manifest_resume.json`
+- `command_resume.sh`
+- `run_status_resume.json`
+- `run.log` is appended
+
+## Profile design
+
+Profiles live in `configs/train/infra_profiles.json`.
+- Use `_base` for inheritance to avoid duplication.
+- Keys beginning with `_` are treated as metadata.
+- Launcher validates required keys and enum/bool-like values before execution.

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import sys
 import json
-import random
 import argparse
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
@@ -35,10 +34,9 @@ from pytorch_lightning.callbacks import (
 
 # Dataset
 from omnigraph.data.vg_scene_graph_dataset import (  # noqa: E402
-    build_vg_vocabs_from_file,
+    build_vg_vocabs_from_items,
     VGSceneGraphDataset,
 )
-from omnigraph.data.vg_graph_qa import build_vg_graph_qa_records  # noqa: E402
 from omnigraph.train.common import (  # noqa: E402
     build_binary_aux_targets,
     build_chat_inputs_and_labels,
@@ -46,6 +44,11 @@ from omnigraph.train.common import (  # noqa: E402
     load_region_pairs,
     parse_precision as _parse_precision,
     parse_val_check_interval as _parse_val_check_interval,
+)
+from omnigraph.train.pipeline_data import (  # noqa: E402
+    build_graph_qa_records_with_pseudo,
+    load_merged_scene_graph_items,
+    split_indices_by_image_id,
 )
 
 # Model
@@ -165,31 +168,16 @@ def split_by_image_id(
     Split by image_id to avoid leakage:
     all phrases under an image_id go either train or val.
     """
-    image_ids = sorted({int(s["image_id"]) for s in dataset.samples})
-    rng = random.Random(seed)
-    rng.shuffle(image_ids)
-
-    if len(image_ids) <= 1:
-        # degenerate: still create a tiny val
-        val_set = set(image_ids)
-    else:
-        val_n = max(1, int(len(image_ids) * float(val_ratio)))
-        val_set = set(image_ids[:val_n])
-
-    train_idx: List[int] = []
-    val_idx: List[int] = []
-    for i, s in enumerate(dataset.samples):
-        iid = int(s["image_id"])
-        if iid in val_set:
-            val_idx.append(i)
-        else:
-            train_idx.append(i)
-
-    if len(train_idx) == 0:
-        # ensure non-empty train
-        train_idx = val_idx[:-1]
-        val_idx = val_idx[-1:]
-
+    train_idx, val_idx, _, _ = split_indices_by_image_id(
+        dataset.samples,
+        val_ratio=float(val_ratio),
+        seed=int(seed),
+        image_id_key="image_id",
+        fallback_when_train_empty=True,
+        require_non_empty_train=False,
+        require_non_empty_val=False,
+        error_prefix="Stage2A split",
+    )
     return Subset(dataset, train_idx), Subset(dataset, val_idx)
 
 
@@ -745,6 +733,23 @@ class ProjectorPL(pl.LightningModule):
         return loss
 
 
+class PeriodicSaveLastCheckpoint(pl.Callback):
+    """Force-save trainer state to last.ckpt every N steps for OOM recovery."""
+
+    def __init__(self, every_n_steps: int, ckpt_path: str):
+        super().__init__()
+        self.every_n_steps = max(1, int(every_n_steps))
+        self.ckpt_path = str(ckpt_path)
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):  # type: ignore[override]
+        step = int(getattr(trainer, "global_step", 0))
+        if step <= 0:
+            return
+        if step % self.every_n_steps != 0:
+            return
+        trainer.save_checkpoint(self.ckpt_path)
+
+
 # ---------------------------------------------------------------------------
 # Entry (Stage2-A only)
 # ---------------------------------------------------------------------------
@@ -763,6 +768,12 @@ def main():
         default="auto",
         choices=["auto", "no_stage1", "legacy_stage1"],
         help="auto: perceiver=>no_stage1, qformer=>legacy_stage1",
+    )
+    ap.add_argument(
+        "--bootstrap_mode",
+        type=str,
+        default="",
+        help="Alias of --stage2A_bootstrap_mode.",
     )
 
     ap.add_argument("--gpu", type=int, default=0, help="GPU index; use -1 for CPU")
@@ -815,10 +826,15 @@ def main():
     ap.add_argument("--lr", type=float, default=5e-5)
     ap.add_argument("--max_steps", type=int, default=80000)
 
-    ap.add_argument("--save_dir", type=str, default="checkpoints_projector_vg/stage2A")
+    ap.add_argument("--save_dir", type=str, default="checkpoints_projector_vg/graph_bootstrap")
+    ap.add_argument("--resume_from_checkpoint", type=str, default="", help="Resume full trainer state from this checkpoint.")
+    ap.add_argument("--checkpoint_every_n_steps", type=int, default=1000, help="Force-save last.ckpt every N train steps (0 to disable).")
     ap.add_argument("--disable_graph_qa", action="store_true", help="Disable synthetic graph QA from VG scene graphs.")
     ap.add_argument("--graph_qa_max_per_image", type=int, default=3, help="Max synthetic QA pairs per image.")
     ap.add_argument("--graph_qa_repeat", type=int, default=2, help="Repeat factor for synthetic graph QA samples.")
+    ap.add_argument("--extra_scene_graphs", type=str, default="", help="Comma-separated extra VG-style scene graph JSON files (pseudo graphs).")
+    ap.add_argument("--pseudo_graph_qa_max_per_image", type=int, default=2, help="Max synthetic QA pairs per pseudo-graph image.")
+    ap.add_argument("--pseudo_graph_qa_repeat", type=int, default=1, help="Repeat factor for pseudo-graph synthetic QA.")
     ap.add_argument("--graph_qa_seed", type=int, default=42, help="Random seed for synthetic graph QA generation.")
 
     ap.add_argument(
@@ -827,8 +843,21 @@ def main():
         default="",
         help="Path to Stage1 graph_qformer checkpoint (graph_qformer_stage1.pt)",
     )
+    ap.add_argument(
+        "--graph_tokenizer_ckpt",
+        type=str,
+        default="",
+        help="Alias of --stage1_qformer_ckpt for legacy qformer bootstrap.",
+    )
 
     args = ap.parse_args()
+    resume_ckpt = str(args.resume_from_checkpoint).strip()
+    if resume_ckpt and not Path(resume_ckpt).exists():
+        raise FileNotFoundError(f"--resume_from_checkpoint not found: {resume_ckpt}")
+    if str(args.bootstrap_mode).strip():
+        args.stage2A_bootstrap_mode = str(args.bootstrap_mode).strip()
+    if str(args.graph_tokenizer_ckpt).strip():
+        args.stage1_qformer_ckpt = str(args.graph_tokenizer_ckpt).strip()
     pl.seed_everything(int(args.seed), workers=True)
     stage1_ckpt_str = str(args.stage1_qformer_ckpt).strip()
     resolved_bootstrap = _resolve_stage2a_bootstrap_mode(
@@ -837,11 +866,11 @@ def main():
         stage1_qformer_ckpt=stage1_ckpt_str if stage1_ckpt_str else None,
     )
     if resolved_bootstrap == "legacy_stage1":
-        print("[Pipeline] Stage2A start: legacy_stage1 bootstrap enabled.")
+        print("[Pipeline] GraphBootstrap start: legacy_stage1 bootstrap enabled.")
     else:
-        print("[Pipeline] Stage2A start: no_stage1 bootstrap enabled (default new pipeline).")
+        print("[Pipeline] GraphBootstrap start: no_stage1 bootstrap enabled (default new pipeline).")
     print(
-        f"[Stage2A] bootstrap_mode={resolved_bootstrap} "
+        f"[GraphBootstrap] bootstrap_mode={resolved_bootstrap} "
         f"graph_tokenizer_type={args.graph_tokenizer_type}"
     )
 
@@ -854,15 +883,26 @@ def main():
         if stage1_ckpt is None or not stage1_ckpt.exists():
             raise FileNotFoundError(f"--stage1_qformer_ckpt not found: {stage1_ckpt_str}")
 
-    # 1) build vocabs
-    obj_vocab, pred_vocab, attr_vocab = build_vg_vocabs_from_file(args.scene_graphs, min_freq=args.min_freq)
+    # 1) load+merge scene graphs and build vocabs
+    base_items, merged_items, pseudo_items, extra_paths, merge_stats = load_merged_scene_graph_items(
+        scene_graphs_path=str(args.scene_graphs),
+        extra_scene_graphs=str(args.extra_scene_graphs),
+    )
+    print(
+        "[SceneGraphs] "
+        f"base={merge_stats.get('base_items', 0)} "
+        f"extra_files={len(extra_paths)} extra_items={merge_stats.get('extra_items', 0)} "
+        f"kept={merge_stats.get('kept', 0)} dropped_dup={merge_stats.get('dropped_duplicate_image_id', 0)}"
+    )
+    obj_vocab, pred_vocab, attr_vocab = build_vg_vocabs_from_items(merged_items, min_freq=args.min_freq)
     num_obj = len(obj_vocab.stoi)
     num_attr = len(attr_vocab.stoi)
     print(f"[Vocab] NUM_OBJ={num_obj} NUM_ATTR={num_attr}")
 
     # 2) scene graph dataset
     sg_dataset = VGSceneGraphDataset(
-        scene_graphs_path=args.scene_graphs,
+        scene_graphs_path=None,
+        scene_graph_items=merged_items,
         obj_vocab=obj_vocab,
         pred_vocab=pred_vocab,
         attr_vocab=attr_vocab,
@@ -876,22 +916,25 @@ def main():
     region_pairs = load_region_pairs(args.regions)
     print(f"[Regions] loaded pairs={len(region_pairs)} from {args.regions}")
 
-    qa_records: List[Dict[str, Any]] = []
-    if not bool(args.disable_graph_qa):
-        qa_records = build_vg_graph_qa_records(
-            scene_graph_items=sg_dataset.items,
-            max_per_image=int(args.graph_qa_max_per_image),
-            seed=int(args.graph_qa_seed),
+    qa_records, qa_summary = build_graph_qa_records_with_pseudo(
+        disable_graph_qa=bool(args.disable_graph_qa),
+        base_scene_graph_items=base_items,
+        pseudo_scene_graph_items=pseudo_items,
+        graph_qa_max_per_image=int(args.graph_qa_max_per_image),
+        graph_qa_repeat=int(args.graph_qa_repeat),
+        pseudo_graph_qa_max_per_image=int(args.pseudo_graph_qa_max_per_image),
+        pseudo_graph_qa_repeat=int(args.pseudo_graph_qa_repeat),
+        graph_qa_seed=int(args.graph_qa_seed),
+    )
+    if bool(qa_summary.get("enabled", False)):
+        print(
+            "[GraphQA] "
+            f"real_pairs={int(qa_summary.get('real_pairs', 0))}(repeat={int(qa_summary.get('real_repeat', 1))}) "
+            f"pseudo_pairs={int(qa_summary.get('pseudo_pairs', 0))}(repeat={int(qa_summary.get('pseudo_repeat', 1))}) "
+            f"total={int(qa_summary.get('total_pairs', len(qa_records)))}"
         )
-        repeat = max(1, int(args.graph_qa_repeat))
-        if repeat > 1 and len(qa_records) > 0:
-            qa_records = qa_records * repeat
-        print(f"[GraphQA] synthetic_pairs={len(qa_records)} (repeat={repeat})")
-        if qa_records:
-            type_counts: Dict[str, int] = {}
-            for rec in qa_records:
-                qa_type = str(rec.get("qa_type", "unknown"))
-                type_counts[qa_type] = type_counts.get(qa_type, 0) + 1
+        type_counts = dict(qa_summary.get("type_counts", {}) or {})
+        if type_counts:
             summary = ", ".join(f"{k}:{type_counts[k]}" for k in sorted(type_counts.keys()))
             print(f"[GraphQA] type_dist={summary}")
     else:
@@ -973,7 +1016,7 @@ def main():
 
     ckpt_cb = ModelCheckpoint(
         dirpath=str(save_dir),
-        filename="stage2A-step={step:07d}-val_loss={val_loss:.3f}",
+        filename="graph_bootstrap-step={step:07d}-val_loss={val_loss:.3f}",
         save_top_k=1,
         monitor="val_loss",
         mode="min",
@@ -987,6 +1030,12 @@ def main():
         min_delta=float(args.min_delta),
         verbose=True,
     )
+    callbacks = [ckpt_cb, lr_monitor, es]
+    ckpt_every_n = max(0, int(args.checkpoint_every_n_steps))
+    if ckpt_every_n > 0:
+        periodic_ckpt_path = save_dir / "last.ckpt"
+        callbacks.append(PeriodicSaveLastCheckpoint(every_n_steps=ckpt_every_n, ckpt_path=str(periodic_ckpt_path)))
+        print(f"[GraphBootstrap] periodic last.ckpt save enabled: every_n_steps={ckpt_every_n} path={periodic_ckpt_path}")
 
     use_gpu = torch.cuda.is_available() and int(args.gpu) >= 0
     devices = [int(args.gpu)] if use_gpu else 1
@@ -1001,7 +1050,7 @@ def main():
         precision=_parse_precision(args.precision),
         max_steps=int(args.max_steps),
         max_epochs=999999,
-        callbacks=[ckpt_cb, lr_monitor, es],
+        callbacks=callbacks,
         log_every_n_steps=10,
         gradient_clip_val=1.0,
         accumulate_grad_batches=max(1, int(args.accumulate_grad_batches)),
@@ -1013,17 +1062,32 @@ def main():
         enable_model_summary=False,
     )
 
-    trainer.fit(pl_model, train_loader, val_loader)
+    if resume_ckpt:
+        print(f"[GraphBootstrap] resume trainer state from ckpt: {resume_ckpt}")
+        trainer.fit(pl_model, train_loader, val_loader, ckpt_path=resume_ckpt)
+    else:
+        trainer.fit(pl_model, train_loader, val_loader)
 
     best_path = ckpt_cb.best_model_path or ""
     export_path = save_dir / "model_state_dict.pt"
     torch.save(pl_model.model.state_dict(), str(export_path))
     stage_meta = {
-        "stage": "stage2A",
+        "stage": "graph_bootstrap",
+        "legacy_stage": "stage2A",
         "stage1_qformer_ckpt": str(stage1_ckpt) if stage1_ckpt else None,
         "num_obj": int(num_obj),
         "num_attr": int(num_attr),
+        "scene_graph_sources": {
+            "base_scene_graphs": str(args.scene_graphs),
+            "extra_scene_graphs": list(extra_paths),
+            "merge_stats": merge_stats,
+        },
+        "pseudo_graph_qa_config": {
+            "max_per_image": int(args.pseudo_graph_qa_max_per_image),
+            "repeat": int(args.pseudo_graph_qa_repeat),
+        },
         "stage2A_bootstrap": pl_model.stage2A_bootstrap,
+        "graph_bootstrap_config": pl_model.stage2A_bootstrap,
         "stage1_load_info": pl_model.stage1_load_info,
         "graph_tokenizer_config": pl_model.model.graph_tokenizer_config,
         "node_encoder_config": pl_model.model.node_encoder_config,
@@ -1033,12 +1097,14 @@ def main():
         "best_ckpt": best_path,
         "export_path": str(export_path),
     }
-    (save_dir / "stage2A_meta.json").write_text(json.dumps(stage_meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[stage2A] exported state_dict -> {export_path}")
+    stage_meta_text = json.dumps(stage_meta, ensure_ascii=False, indent=2)
+    (save_dir / "graph_bootstrap_meta.json").write_text(stage_meta_text, encoding="utf-8")
+    (save_dir / "stage2A_meta.json").write_text(stage_meta_text, encoding="utf-8")
+    print(f"[GraphBootstrap] exported state_dict -> {export_path}")
     if best_path:
-        print(f"[stage2A] best ckpt -> {best_path}")
+        print(f"[GraphBootstrap] best ckpt -> {best_path}")
     else:
-        print("[stage2A] warning: best ckpt not found (check monitor='val_loss' and val loader).")
+        print("[GraphBootstrap] warning: best ckpt not found (check monitor='val_loss' and val loader).")
 
 
 if __name__ == "__main__":

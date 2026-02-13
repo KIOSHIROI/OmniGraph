@@ -1,6 +1,7 @@
 import json
 import hashlib
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import torch
 from torch.utils.data import Dataset
 from torch_geometric.data import Data
@@ -27,7 +28,11 @@ class Vocab:
         return self.stoi.get(tok, self.unk)
 
 def build_vg_vocabs_from_file(path: str, min_freq: int = 2):
-    items = json.load(open(path, "r", encoding="utf-8"))
+    items = load_vg_scene_graph_items(path)
+    return build_vg_vocabs_from_items(items, min_freq=min_freq)
+
+
+def build_vg_vocabs_from_items(items: Sequence[Dict[str, Any]], min_freq: int = 2):
     obj_t, pred_t, attr_t = [], [], []
     for it in items:
         for o in it.get("objects", []) or []:
@@ -41,10 +46,75 @@ def build_vg_vocabs_from_file(path: str, min_freq: int = 2):
                 pred_t.append(str(p))
     return Vocab.build(obj_t, min_freq), Vocab.build(pred_t, min_freq), Vocab.build(attr_t, min_freq)
 
+
+def load_vg_scene_graph_items(path: str) -> List[Dict[str, Any]]:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Scene graph file not found: {path}")
+    data = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError(f"Scene graph file must be a JSON list: {path}")
+    return [x for x in data if isinstance(x, dict)]
+
+
+def parse_scene_graph_paths(extra_scene_graphs: str | None) -> List[str]:
+    if not extra_scene_graphs:
+        return []
+    out: List[str] = []
+    for s in str(extra_scene_graphs).split(","):
+        t = s.strip()
+        if t:
+            out.append(t)
+    return out
+
+
+def merge_scene_graph_items(
+    base_items: Sequence[Dict[str, Any]],
+    extra_items_list: Iterable[Sequence[Dict[str, Any]]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """
+    Merge scene-graph lists by image_id with first-wins policy.
+    Base items always keep priority over extras on duplicated image_id.
+    """
+    merged: List[Dict[str, Any]] = []
+    seen_image_ids: set[str] = set()
+    stats = {
+        "base_items": 0,
+        "extra_items": 0,
+        "kept": 0,
+        "dropped_duplicate_image_id": 0,
+    }
+
+    def _push(items: Sequence[Dict[str, Any]], is_base: bool) -> None:
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            if is_base:
+                stats["base_items"] += 1
+            else:
+                stats["extra_items"] += 1
+            image_id = str(it.get("image_id", "")).strip()
+            if not image_id:
+                # Keep malformed samples; they are filtered later by datasets.
+                merged.append(dict(it))
+                stats["kept"] += 1
+                continue
+            if image_id in seen_image_ids:
+                stats["dropped_duplicate_image_id"] += 1
+                continue
+            seen_image_ids.add(image_id)
+            merged.append(dict(it))
+            stats["kept"] += 1
+
+    _push(base_items, is_base=True)
+    for extra_items in extra_items_list:
+        _push(extra_items, is_base=False)
+    return merged, stats
+
 class VGSceneGraphDataset(Dataset):
     def __init__(
         self,
-        scene_graphs_path: str,
+        scene_graphs_path: str | None,
         obj_vocab: Vocab,
         pred_vocab: Vocab,
         attr_vocab: Vocab,
@@ -54,8 +124,14 @@ class VGSceneGraphDataset(Dataset):
         # VG 原始文件通常没有 width/height；如果没有，就用 bbox 的 max 做归一化
         use_bbox_max_norm: bool = True,
         hash_buckets: int = 65536,
+        scene_graph_items: Optional[Sequence[Dict[str, Any]]] = None,
     ):
-        self.items: List[Dict[str, Any]] = json.load(open(scene_graphs_path, "r", encoding="utf-8"))
+        if scene_graph_items is not None:
+            self.items = [dict(x) for x in scene_graph_items if isinstance(x, dict)]
+        else:
+            if not scene_graphs_path:
+                raise ValueError("VGSceneGraphDataset requires scene_graphs_path or scene_graph_items.")
+            self.items = load_vg_scene_graph_items(str(scene_graphs_path))
         self.obj_vocab = obj_vocab
         self.pred_vocab = pred_vocab
         self.attr_vocab = attr_vocab

@@ -34,13 +34,18 @@ def _build_prompt(tokenizer: Any, prompt: str) -> str:
 
 def _load_stage3_meta(ckpt_path: str) -> Dict[str, Any]:
     ckpt = Path(ckpt_path)
-    meta_path = ckpt.parent / "stage3_meta.json"
-    if not meta_path.exists():
-        return {}
-    try:
-        return json.loads(meta_path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    candidates = [
+        ckpt.parent / "multimodal_tune_meta.json",
+        ckpt.parent / "stage3_meta.json",
+    ]
+    for meta_path in candidates:
+        if not meta_path.exists():
+            continue
+        try:
+            return json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+    return {}
 
 
 def _normalize_graph_tokenizer_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -59,26 +64,26 @@ def _normalize_graph_tokenizer_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Infer VG region captions with OmniGraph stage3.")
+    ap = argparse.ArgumentParser(description="Infer VG region captions with OmniGraph multimodal_tune model.")
     ap.add_argument("--scene_graphs", required=True)
     ap.add_argument("--regions", required=True)
     ap.add_argument("--image_root", required=True)
-    ap.add_argument("--ckpt", required=True, help="stage3 state_dict (omnigraph_stage3_state_dict.pt)")
+    ap.add_argument("--ckpt", required=True, help="multimodal_tune state_dict (omnigraph_multimodal_tune_state_dict.pt)")
     ap.add_argument("--output", required=True, help="pred jsonl")
     ap.add_argument("--llm", default="Qwen/Qwen2.5-7B-Instruct")
     ap.add_argument("--vision", default="Salesforce/blip2-flan-t5-xl")
     ap.add_argument("--graph_model", default="clip_gt_arxiv_pub")
     ap.add_argument("--graph_tokenizer_type", default="auto", choices=["auto", "qformer", "perceiver"])
-    ap.add_argument("--perceiver_num_latents", type=int, default=-1, help="<=0 means read from stage3_meta or fallback.")
-    ap.add_argument("--perceiver_num_layers", type=int, default=-1, help="<=0 means read from stage3_meta or fallback.")
-    ap.add_argument("--perceiver_num_heads", type=int, default=-1, help="<=0 means read from stage3_meta or fallback.")
-    ap.add_argument("--perceiver_ff_mult", type=int, default=-1, help="<=0 means read from stage3_meta or fallback.")
-    ap.add_argument("--perceiver_dropout", type=float, default=-1.0, help="<0 means read from stage3_meta or fallback.")
+    ap.add_argument("--perceiver_num_latents", type=int, default=-1, help="<=0 means read from multimodal_tune_meta (or legacy stage3_meta).")
+    ap.add_argument("--perceiver_num_layers", type=int, default=-1, help="<=0 means read from multimodal_tune_meta (or legacy stage3_meta).")
+    ap.add_argument("--perceiver_num_heads", type=int, default=-1, help="<=0 means read from multimodal_tune_meta (or legacy stage3_meta).")
+    ap.add_argument("--perceiver_ff_mult", type=int, default=-1, help="<=0 means read from multimodal_tune_meta (or legacy stage3_meta).")
+    ap.add_argument("--perceiver_dropout", type=float, default=-1.0, help="<0 means read from multimodal_tune_meta (or legacy stage3_meta).")
     ap.add_argument("--node_encoder_type", default="auto", choices=["auto", "hybrid", "open_vocab", "legacy_vg"])
-    ap.add_argument("--node_encoder_alpha_init", type=float, default=-1.0, help="<0 means read from stage3_meta or fallback.")
-    ap.add_argument("--node_encoder_out_dim", type=int, default=0, help="<=0 means read from stage3_meta or fallback 128.")
-    ap.add_argument("--enable_gvl_adapter", type=int, default=-1, choices=[-1, 0, 1], help="-1 means read from stage3_meta or fallback.")
-    ap.add_argument("--gvl_adapter_gate_init", type=float, default=-1.0, help="<0 means read from stage3_meta or fallback.")
+    ap.add_argument("--node_encoder_alpha_init", type=float, default=-1.0, help="<0 means read from multimodal_tune_meta (or legacy stage3_meta).")
+    ap.add_argument("--node_encoder_out_dim", type=int, default=0, help="<=0 means read from multimodal_tune_meta (or legacy stage3_meta) fallback 128.")
+    ap.add_argument("--enable_gvl_adapter", type=int, default=-1, choices=[-1, 0, 1], help="-1 means read from multimodal_tune_meta (or legacy stage3_meta).")
+    ap.add_argument("--gvl_adapter_gate_init", type=float, default=-1.0, help="<0 means read from multimodal_tune_meta (or legacy stage3_meta).")
     ap.add_argument("--batch_size", type=int, default=1)
     ap.add_argument("--max_length", type=int, default=128)
     ap.add_argument("--max_new_tokens", type=int, default=64)

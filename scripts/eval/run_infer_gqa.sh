@@ -48,7 +48,10 @@ QUESTIONS_JSONL=${QUESTIONS_JSONL:-$REPO/data/gqa/val_balanced.jsonl}
 SCENEGRAPHS_RAW=${SCENEGRAPHS_RAW:-$REPO/data/gqa/contents/sceneGraphs/val_sceneGraphs.json}
 SCENEGRAPHS_VG=${SCENEGRAPHS_VG:-$REPO/data/gqa/scene_graphs_val_vg.json}
 IMAGE_ROOT=${IMAGE_ROOT:-$REPO/data/gqa/contents/images}
-CKPT=${CKPT:-$REPO/checkpoints_stage3_paper/omnigraph_stage3_state_dict.pt}
+CKPT=${CKPT:-$REPO/checkpoints_multimodal_tune/omnigraph_multimodal_tune_state_dict.pt}
+if [ ! -f "$CKPT" ] && [ -f "$REPO/checkpoints_stage3_paper/omnigraph_stage3_state_dict.pt" ]; then
+  CKPT="$REPO/checkpoints_stage3_paper/omnigraph_stage3_state_dict.pt"
+fi
 PRED=${PRED:-$REPO/data/gqa/pred_val_balanced_paper.jsonl}
 EVAL_TXT=${EVAL_TXT:-$REPO/data/gqa/eval_val_balanced_paper.txt}
 
