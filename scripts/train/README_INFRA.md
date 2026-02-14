@@ -10,6 +10,17 @@ python scripts/train/infra_launcher.py --profile 4090 --mode full --gpu 0
 python scripts/train/infra_launcher.py --profile pro6000 --mode full --gpu 0
 ```
 
+## Prefetch models (new server)
+
+Prefetch all model repos needed by current profile (LLM + vision + stage1 text encoder), plus optional alternates:
+
+```bash
+python scripts/train/prefetch_models.py \
+  --profile pro6000 \
+  --include-alt-llm \
+  --include-legacy-qformer
+```
+
 List and validate profiles:
 
 ```bash
