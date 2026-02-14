@@ -75,6 +75,7 @@
   "pro6000": {
     "_description": "Aggressive single-GPU profile for RTX PRO 6000 class cards (48GB+).",
     "_base": "_4090_base",
+    "LLM_MODEL": "Qwen/Qwen2.5-7B-Instruct",
     "LOW_VRAM_4090": "0",
     "AUTO_BATCH_SCALE": "1.25",
     "MAX_AUTO_BATCH": "128",
