@@ -84,5 +84,27 @@
     "STRICT_SPRINT_TARGET": "0.4450",
     "QUERY_TARGET": "0.2650",
     "QUERY_SPRINT_TARGET": "0.2850"
+  },
+  "pro6000_fast": {
+    "_description": "Faster turnaround profile for RTX PRO 6000 (reduced steps/data mixing, keeps pipeline behavior).",
+    "_base": "pro6000",
+    "LLM_MODEL": "Qwen/Qwen2.5-3B-Instruct",
+    "AUTO_BATCH_SCALE": "1.5",
+    "S2A_MAX_STEPS": "30000",
+    "S2B_MAX_STEPS": "30000",
+    "S3_MAX_STEPS": "12000",
+    "S2A_GRAPH_QA_REPEAT": "1",
+    "S2B_GRAPH_QA_REPEAT": "2",
+    "S3_GRAPH_QA_REPEAT": "1",
+    "S2A_PSEUDO_GRAPH_QA_REPEAT": "0",
+    "S2B_PSEUDO_GRAPH_QA_REPEAT": "0",
+    "S3_PSEUDO_GRAPH_QA_REPEAT": "0",
+    "S2A_VAL_CHECK_INTERVAL": "10000",
+    "S2B_VAL_CHECK_INTERVAL": "10000",
+    "S3_VAL_CHECK_INTERVAL": "10000",
+    "S2A_NUM_WORKERS": "12",
+    "S2B_NUM_WORKERS": "12",
+    "S3_NUM_WORKERS": "8",
+    "RUN_ROUND2_ON_FAIL": "0"
   }
 }

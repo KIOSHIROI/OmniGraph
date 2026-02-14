@@ -2,7 +2,7 @@ import os
 from typing import Optional
 
 DEFAULT_HF_ENDPOINT = "https://hf-mirror.com"
-DEFAULT_HF_CACHE_DIR = "/media/disk/02drive/13hias/.cache"
+DEFAULT_HF_CACHE_DIR = "/root/autodl-tmp/.cache"
 
 
 def setup_env(hf_endpoint: Optional[str] = None, hf_cache_dir: Optional[str] = None) -> None:

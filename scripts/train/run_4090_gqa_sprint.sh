@@ -10,6 +10,11 @@ cd "$WORKDIR"
 
 PYTHON_BIN=${PYTHON_BIN:-python}
 REPO=${REPO:-"$WORKDIR"}
+if [ -n "${PYTHONPATH:-}" ]; then
+  export PYTHONPATH="$REPO:$PYTHONPATH"
+else
+  export PYTHONPATH="$REPO"
+fi
 GPU=${GPU:-0}
 ISOLATE_GPU=${ISOLATE_GPU:-1}
 ORIG_GPU=${GPU}
@@ -24,6 +29,26 @@ export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 OMNIGRAPH_HF_CACHE=${OMNIGRAPH_HF_CACHE:-/media/disk/02drive/13hias/.cache}
 OMNIGRAPH_HF_ENDPOINT=${OMNIGRAPH_HF_ENDPOINT:-https://hf-mirror.com}
 export OMNIGRAPH_HF_CACHE OMNIGRAPH_HF_ENDPOINT
+
+CPU_CORES=$(nproc 2>/dev/null || echo 8)
+THREAD_DEFAULT=$((CPU_CORES / 2))
+if [ "$THREAD_DEFAULT" -lt 1 ]; then THREAD_DEFAULT=1; fi
+if [ "$THREAD_DEFAULT" -gt 16 ]; then THREAD_DEFAULT=16; fi
+
+ensure_positive_int_env() {
+  local key="$1"
+  local fallback="$2"
+  local cur="${!key-}"
+  if [[ ! "$cur" =~ ^[1-9][0-9]*$ ]]; then
+    export "$key=$fallback"
+    echo "[Config][Fix] ${key} invalid (${cur:-<unset>}) -> ${fallback}"
+  fi
+}
+
+ensure_positive_int_env OMP_NUM_THREADS "$THREAD_DEFAULT"
+ensure_positive_int_env MKL_NUM_THREADS "$THREAD_DEFAULT"
+ensure_positive_int_env OPENBLAS_NUM_THREADS "$OMP_NUM_THREADS"
+ensure_positive_int_env NUMEXPR_NUM_THREADS "$OMP_NUM_THREADS"
 
 STRICT_TARGET=${STRICT_TARGET:-0.4200}
 STRICT_SPRINT_TARGET=${STRICT_SPRINT_TARGET:-0.4400}
@@ -334,6 +359,12 @@ if [ -n "${MULTIMODAL_TUNE_DIR:-}" ]; then STAGE3_DIR="${MULTIMODAL_TUNE_DIR}"; 
 if [ -n "${GRAPH_REFINE_R2_DIR:-}" ]; then STAGE2B_R2_DIR="${GRAPH_REFINE_R2_DIR}"; fi
 if [ -n "${MULTIMODAL_TUNE_R2_DIR:-}" ]; then STAGE3_R2_DIR="${MULTIMODAL_TUNE_R2_DIR}"; fi
 
+S2A_MANUAL_STOP_FILE=${S2A_MANUAL_STOP_FILE:-"$STAGE2A_DIR/STOP_EARLY"}
+S2B_MANUAL_STOP_FILE=${S2B_MANUAL_STOP_FILE:-"$STAGE2B_DIR/STOP_EARLY"}
+S3_MANUAL_STOP_FILE=${S3_MANUAL_STOP_FILE:-"$STAGE3_DIR/STOP_EARLY"}
+S2B_R2_MANUAL_STOP_FILE=${S2B_R2_MANUAL_STOP_FILE:-"$STAGE2B_R2_DIR/STOP_EARLY"}
+S3_R2_MANUAL_STOP_FILE=${S3_R2_MANUAL_STOP_FILE:-"$STAGE3_R2_DIR/STOP_EARLY"}
+
 GQA_QUESTIONS_JSON=${GQA_QUESTIONS_JSON:-"$OMNIGRAPH_DATA_ROOT/gqa/contents/questions/val_balanced_questions.json"}
 GQA_QUESTIONS_JSONL=${GQA_QUESTIONS_JSONL:-"$OMNIGRAPH_DATA_ROOT/gqa/val_balanced.jsonl"}
 GQA_SCENE_RAW=${GQA_SCENE_RAW:-"$OMNIGRAPH_DATA_ROOT/gqa/contents/sceneGraphs/val_sceneGraphs.json"}
@@ -609,14 +640,40 @@ run_with_auto_batch_retry() {
 
 resolve_stage2a_ckpt() {
   local ckpt="${STAGE2A_CKPT:-}"
+  local meta_path="$STAGE2A_DIR/graph_bootstrap_meta.json"
+  if [ ! -f "$meta_path" ]; then
+    meta_path="$STAGE2A_DIR/stage2A_meta.json"
+  fi
   if [ -z "$ckpt" ]; then
-    local meta_path="$STAGE2A_DIR/graph_bootstrap_meta.json"
-    if [ ! -f "$meta_path" ]; then
-      meta_path="$STAGE2A_DIR/stage2A_meta.json"
-    fi
     ckpt=$("$PYTHON_BIN" "$SELECT_CKPT" \
       --meta "$meta_path" \
       --fallback "$STAGE2A_DIR/last.ckpt")
+  fi
+  if [ ! -f "$ckpt" ] && [ -f "$meta_path" ]; then
+    local export_ckpt=""
+    export_ckpt=$("$PYTHON_BIN" - "$meta_path" <<'PY'
+import json
+import os
+import sys
+
+meta_path = sys.argv[1]
+try:
+    meta = json.load(open(meta_path, "r", encoding="utf-8"))
+except Exception:
+    print("")
+    raise SystemExit(0)
+
+candidate = str(meta.get("export_path", "") or "").strip()
+if candidate and os.path.isfile(candidate):
+    print(candidate)
+else:
+    print("")
+PY
+)
+    if [ -n "$export_ckpt" ] && [ -f "$export_ckpt" ]; then
+      echo "[GraphBootstrap] last/best ckpt missing, fallback to exported state_dict: $export_ckpt"
+      ckpt="$export_ckpt"
+    fi
   fi
   if [ ! -f "$ckpt" ]; then
     echo "[GraphBootstrap] checkpoint not found: $ckpt"
@@ -673,6 +730,7 @@ echo "[Config] pseudo_qa_r2: S2B(max=${S2B_R2_PSEUDO_GRAPH_QA_MAX_PER_IMAGE},rep
 echo "[Config] S2A bs=${S2A_BATCH_SIZE} max_len=${S2A_MAX_LENGTH} workers=${S2A_NUM_WORKERS} prec=${S2A_PRECISION}"
 echo "[Config] S2B bs=${S2B_BATCH_SIZE} max_len=${S2B_MAX_LENGTH} workers=${S2B_NUM_WORKERS} prec=${S2B_PRECISION}"
 echo "[Config] S3  bs=${S3_BATCH_SIZE} max_len=${S3_MAX_LENGTH} workers=${S3_NUM_WORKERS} prec=${S3_PRECISION}"
+echo "[Config] manual_stop: S2A=${S2A_MANUAL_STOP_FILE} S2B=${S2B_MANUAL_STOP_FILE} S3=${S3_MANUAL_STOP_FILE}"
 echo "[Config] step_ckpt: S2A=${S2A_CHECKPOINT_EVERY_N_STEPS} S2B=${S2B_CHECKPOINT_EVERY_N_STEPS} S3=${S3_CHECKPOINT_EVERY_N_STEPS} S2B_R2=${S2B_R2_CHECKPOINT_EVERY_N_STEPS} S3_R2=${S3_R2_CHECKPOINT_EVERY_N_STEPS}"
 echo "[Config] val: S2A(interval=${S2A_VAL_CHECK_INTERVAL},limit=${S2A_LIMIT_VAL_BATCHES}) S2B(interval=${S2B_VAL_CHECK_INTERVAL},limit=${S2B_LIMIT_VAL_BATCHES}) S3(interval=${S3_VAL_CHECK_INTERVAL},limit=${S3_LIMIT_VAL_BATCHES})"
 echo "[Config] train_node_encoder: S2A=${S2A_TRAIN_NODE_ENCODER} S2B=${S2B_TRAIN_NODE_ENCODER} S3=${S3_TRAIN_NODE_ENCODER} S2B_R2=${S2B_R2_TRAIN_NODE_ENCODER} S3_R2=${S3_R2_TRAIN_NODE_ENCODER}"
@@ -697,8 +755,16 @@ if [ "$RUN_STAGE3" = "1" ]; then
   test -d "$VG_IMAGE_ROOT" || true
 fi
 if [ "$RUN_EVAL" = "1" ]; then
-  test -f "$GQA_QUESTIONS_JSON"
-  test -f "$GQA_SCENE_RAW"
+  if [ ! -f "$GQA_QUESTIONS_JSON" ]; then
+    echo "[GQA][Error] missing file: GQA_QUESTIONS_JSON=$GQA_QUESTIONS_JSON"
+    echo "[GQA][Hint] provide --data-config with GQA_* paths or set RUN_EVAL=0 for training-only run."
+    exit 1
+  fi
+  if [ ! -f "$GQA_SCENE_RAW" ]; then
+    echo "[GQA][Error] missing file: GQA_SCENE_RAW=$GQA_SCENE_RAW"
+    echo "[GQA][Hint] provide --data-config with GQA_* paths or set RUN_EVAL=0 for training-only run."
+    exit 1
+  fi
 fi
 
 if [ "$RUN_STAGE2A" = "1" ]; then
@@ -751,6 +817,7 @@ if [ "$RUN_STAGE2A" = "1" ]; then
     --val_check_interval "$S2A_VAL_CHECK_INTERVAL" \
     --limit_val_batches "$S2A_LIMIT_VAL_BATCHES" \
     --checkpoint_every_n_steps "$S2A_CHECKPOINT_EVERY_N_STEPS" \
+    --manual_stop_file "$S2A_MANUAL_STOP_FILE" \
     --save_dir "$STAGE2A_DIR")
   if [ "$REQUIRE_STAGE1_CKPT" = "1" ]; then
     S2A_CMD+=(--graph_tokenizer_ckpt "$STAGE1_QFORMER_CKPT")
@@ -809,6 +876,7 @@ if [ "$RUN_STAGE2B" = "1" ]; then
     --val_check_interval "$S2B_VAL_CHECK_INTERVAL" \
     --limit_val_batches "$S2B_LIMIT_VAL_BATCHES" \
     --checkpoint_every_n_steps "$S2B_CHECKPOINT_EVERY_N_STEPS" \
+    --manual_stop_file "$S2B_MANUAL_STOP_FILE" \
     --patience "$S2B_PATIENCE" \
     --min_delta "$S2B_MIN_DELTA" \
     --save_dir "$STAGE2B_DIR")
@@ -871,6 +939,7 @@ if [ "$RUN_STAGE3" = "1" ]; then
     --val_check_interval "$S3_VAL_CHECK_INTERVAL" \
     --limit_val_batches "$S3_LIMIT_VAL_BATCHES" \
     --checkpoint_every_n_steps "$S3_CHECKPOINT_EVERY_N_STEPS" \
+    --manual_stop_file "$S3_MANUAL_STOP_FILE" \
     --patience "$S3_PATIENCE" \
     --min_delta "$S3_MIN_DELTA" \
     --save_dir "$STAGE3_DIR")
@@ -1069,6 +1138,7 @@ S2B_R2_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_graph_refine.py" \
   --val_check_interval "$S2B_R2_VAL_CHECK_INTERVAL" \
   --limit_val_batches "$S2B_R2_LIMIT_VAL_BATCHES" \
   --checkpoint_every_n_steps "$S2B_R2_CHECKPOINT_EVERY_N_STEPS" \
+  --manual_stop_file "$S2B_R2_MANUAL_STOP_FILE" \
   --patience "$S2B_R2_PATIENCE" \
   --min_delta "$S2B_R2_MIN_DELTA" \
   --save_dir "$STAGE2B_R2_DIR")
@@ -1135,6 +1205,7 @@ S3_R2_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_multimodal_tune.py" \
   --val_check_interval "$S3_R2_VAL_CHECK_INTERVAL" \
   --limit_val_batches "$S3_R2_LIMIT_VAL_BATCHES" \
   --checkpoint_every_n_steps "$S3_R2_CHECKPOINT_EVERY_N_STEPS" \
+  --manual_stop_file "$S3_R2_MANUAL_STOP_FILE" \
   --patience "$S3_R2_PATIENCE" \
   --min_delta "$S3_R2_MIN_DELTA" \
   --save_dir "$STAGE3_R2_DIR")

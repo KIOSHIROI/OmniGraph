@@ -23,7 +23,8 @@ import pytorch_lightning as pl
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Subset
 from transformers import AutoTokenizer
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping, TQDMProgressBar
+from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger
 
 # Dataset (你已有)
 from omnigraph.data.vg_scene_graph_dataset import (  # noqa: E402
@@ -456,6 +457,33 @@ class PeriodicSaveLastCheckpoint(pl.Callback):
         trainer.save_checkpoint(self.ckpt_path)
 
 
+class ManualEarlyStopByFile(pl.Callback):
+    """Allow manual early-stop by creating a signal file during training."""
+
+    def __init__(self, stop_file: str, stage_tag: str, save_ckpt_path: Optional[str] = None):
+        super().__init__()
+        self.stop_file = str(stop_file)
+        self.stage_tag = str(stage_tag)
+        self.save_ckpt_path = str(save_ckpt_path) if save_ckpt_path else ""
+        self._triggered = False
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):  # type: ignore[override]
+        if self._triggered:
+            return
+        if not Path(self.stop_file).exists():
+            return
+        step = int(getattr(trainer, "global_step", 0))
+        print(f"[{self.stage_tag}] manual early-stop signal detected: {self.stop_file} (step={step})")
+        if self.save_ckpt_path:
+            try:
+                trainer.save_checkpoint(self.save_ckpt_path)
+                print(f"[{self.stage_tag}] saved manual-stop checkpoint: {self.save_ckpt_path}")
+            except Exception as exc:
+                print(f"[{self.stage_tag}][Warn] failed to save manual-stop checkpoint: {exc}")
+        trainer.should_stop = True
+        self._triggered = True
+
+
 # ---------------------------------------------------------------------------
 # Load stage2-A weights only (no optimizer restore)
 # ---------------------------------------------------------------------------
@@ -463,19 +491,47 @@ class PeriodicSaveLastCheckpoint(pl.Callback):
 
 def _extract_stage2a_provenance_from_ckpt(ckpt_path: str) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     ckpt = torch.load(ckpt_path, map_location="cpu")
-    if not isinstance(ckpt, dict) or "state_dict" not in ckpt:
-        raise RuntimeError(
-            "Stage2B requires a Stage2A Lightning checkpoint (.ckpt) from the strict pipeline."
+    if not isinstance(ckpt, dict):
+        raise RuntimeError("Stage2B failed to load Stage2A checkpoint/state_dict: unsupported object type.")
+
+    if "state_dict" in ckpt:
+        hp = ckpt.get("hyper_parameters", {}) or {}
+        bootstrap, tokenizer_cfg = parse_bootstrap_and_graph_tokenizer_from_hparams(
+            hp=hp,
+            bootstrap_field="stage2A_bootstrap",
+            bootstrap_mode_field="stage2A_bootstrap_mode",
+            context_label="Stage2A",
+            require_legacy_stage1_qformer_ckpt=True,
         )
-    hp = ckpt.get("hyper_parameters", {}) or {}
-    bootstrap, tokenizer_cfg = parse_bootstrap_and_graph_tokenizer_from_hparams(
-        hp=hp,
-        bootstrap_field="stage2A_bootstrap",
-        bootstrap_mode_field="stage2A_bootstrap_mode",
-        context_label="Stage2A",
-        require_legacy_stage1_qformer_ckpt=True,
+        return ckpt, bootstrap, tokenizer_cfg
+
+    # Fallback: raw OmniGraphModel state_dict exported by GraphBootstrap
+    if any(isinstance(v, torch.Tensor) for v in ckpt.values()):
+        ckpt_file = Path(ckpt_path)
+        meta_candidates = [
+            ckpt_file.parent / "graph_bootstrap_meta.json",
+            ckpt_file.parent / "stage2A_meta.json",
+        ]
+        meta_obj: Dict[str, Any] = {}
+        for meta_path in meta_candidates:
+            if meta_path.exists():
+                try:
+                    meta_obj = json.loads(meta_path.read_text(encoding="utf-8"))
+                    break
+                except Exception:
+                    continue
+
+        bootstrap = meta_obj.get("stage2A_bootstrap") or meta_obj.get("graph_bootstrap_config")
+        tokenizer_cfg = meta_obj.get("graph_tokenizer_config")
+        if not isinstance(bootstrap, dict) or not isinstance(tokenizer_cfg, dict):
+            raise RuntimeError(
+                "Stage2B got Stage2A raw state_dict but missing provenance in graph_bootstrap_meta.json/stage2A_meta.json."
+            )
+        return {"state_dict": ckpt}, dict(bootstrap), dict(tokenizer_cfg)
+
+    raise RuntimeError(
+        "Stage2B requires a Stage2A Lightning checkpoint (.ckpt) or GraphBootstrap raw state_dict export."
     )
-    return ckpt, bootstrap, tokenizer_cfg
 
 
 def load_stage2A_weights_only(
@@ -590,6 +646,7 @@ def main():
     ap.add_argument("--save_dir", type=str, default="checkpoints_graph_refine")
     ap.add_argument("--resume_from_checkpoint", type=str, default="", help="Resume full trainer state from this checkpoint.")
     ap.add_argument("--checkpoint_every_n_steps", type=int, default=1000, help="Force-save last.ckpt every N train steps (0 to disable).")
+    ap.add_argument("--manual_stop_file", type=str, default="", help="If this file appears during training, trigger graceful early stop.")
     ap.add_argument("--min_freq", type=int, default=2)
     ap.add_argument("--max_nodes", type=int, default=80)
     ap.add_argument("--max_attrs", type=int, default=6)
@@ -793,7 +850,29 @@ def main():
         patience=args.patience,
         min_delta=args.min_delta,
     )
-    callbacks = [ckpt, lr_monitor, early]
+    try:
+        tb_logger = TensorBoardLogger(
+            save_dir=str(save_dir),
+            name="tb_logs",
+            version="",
+        )
+    except ModuleNotFoundError as exc:
+        print(f"[GraphRefine][Warn] TensorBoard unavailable, fallback to CSV logger: {exc}")
+        tb_logger = CSVLogger(
+            save_dir=str(save_dir),
+            name="csv_logs",
+            version="",
+        )
+    callbacks = [ckpt, lr_monitor, early, TQDMProgressBar(refresh_rate=10)]
+    manual_stop_file = str(args.manual_stop_file).strip() or str(save_dir / "STOP_EARLY")
+    callbacks.append(
+        ManualEarlyStopByFile(
+            stop_file=manual_stop_file,
+            stage_tag="GraphRefine",
+            save_ckpt_path=str(save_dir / "manual_stop.ckpt"),
+        )
+    )
+    print(f"[GraphRefine] manual early-stop enabled: touch file -> {manual_stop_file}")
     ckpt_every_n = max(0, int(args.checkpoint_every_n_steps))
     if ckpt_every_n > 0:
         periodic_ckpt_path = save_dir / "last.ckpt"
@@ -811,7 +890,9 @@ def main():
         precision=_parse_precision(args.precision),
         max_steps=args.max_steps,
         max_epochs=999999,  # max_steps 控制
+        logger=tb_logger,
         callbacks=callbacks,
+        enable_progress_bar=True,
         log_every_n_steps=10,
         gradient_clip_val=1.0,
         accumulate_grad_batches=max(1, int(args.accumulate_grad_batches)),

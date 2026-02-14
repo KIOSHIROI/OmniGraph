@@ -1,9 +1,12 @@
 # omnigraph/train/train_projector.py
 from __future__ import annotations
 
+import errno
+
 import sys
 import json
 import argparse
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
 
@@ -30,7 +33,9 @@ from pytorch_lightning.callbacks import (
     ModelCheckpoint,
     LearningRateMonitor,
     EarlyStopping,
+    TQDMProgressBar,
 )
+from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger
 
 # Dataset
 from omnigraph.data.vg_scene_graph_dataset import (  # noqa: E402
@@ -736,10 +741,12 @@ class ProjectorPL(pl.LightningModule):
 class PeriodicSaveLastCheckpoint(pl.Callback):
     """Force-save trainer state to last.ckpt every N steps for OOM recovery."""
 
-    def __init__(self, every_n_steps: int, ckpt_path: str):
+    def __init__(self, every_n_steps: int, ckpt_path: str, save_weights_only: bool = True):
         super().__init__()
         self.every_n_steps = max(1, int(every_n_steps))
         self.ckpt_path = str(ckpt_path)
+        self.save_weights_only = bool(save_weights_only)
+        self._disk_full_warned = False
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):  # type: ignore[override]
         step = int(getattr(trainer, "global_step", 0))
@@ -747,7 +754,51 @@ class PeriodicSaveLastCheckpoint(pl.Callback):
             return
         if step % self.every_n_steps != 0:
             return
-        trainer.save_checkpoint(self.ckpt_path)
+        try:
+            trainer.save_checkpoint(self.ckpt_path, weights_only=self.save_weights_only)
+            self._disk_full_warned = False
+        except OSError as exc:
+            if getattr(exc, "errno", None) == errno.ENOSPC:
+                if not self._disk_full_warned:
+                    print(
+                        f"[GraphBootstrap][Warn] skip periodic checkpoint at step={step}: "
+                        f"no space left on device for {self.ckpt_path}"
+                    )
+                    self._disk_full_warned = True
+                return
+            raise
+
+
+class ManualEarlyStopByFile(pl.Callback):
+    """Allow manual early-stop by creating a signal file during training."""
+
+    def __init__(self, stop_file: str, stage_tag: str, save_ckpt_path: Optional[str] = None):
+        super().__init__()
+        self.stop_file = str(stop_file)
+        self.stage_tag = str(stage_tag)
+        self.save_ckpt_path = str(save_ckpt_path) if save_ckpt_path else ""
+        self._triggered = False
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):  # type: ignore[override]
+        if self._triggered:
+            return
+        if not Path(self.stop_file).exists():
+            return
+        step = int(getattr(trainer, "global_step", 0))
+        print(f"[{self.stage_tag}] manual early-stop signal detected: {self.stop_file} (step={step})")
+        if self.save_ckpt_path:
+            try:
+                trainer.save_checkpoint(self.save_ckpt_path)
+                print(f"[{self.stage_tag}] saved manual-stop checkpoint: {self.save_ckpt_path}")
+            except OSError as exc:
+                if getattr(exc, "errno", None) == errno.ENOSPC:
+                    print(f"[{self.stage_tag}][Warn] skip manual-stop checkpoint (disk full): {self.save_ckpt_path}")
+                else:
+                    print(f"[{self.stage_tag}][Warn] failed to save manual-stop checkpoint: {exc}")
+            except Exception as exc:
+                print(f"[{self.stage_tag}][Warn] failed to save manual-stop checkpoint: {exc}")
+        trainer.should_stop = True
+        self._triggered = True
 
 
 # ---------------------------------------------------------------------------
@@ -829,6 +880,7 @@ def main():
     ap.add_argument("--save_dir", type=str, default="checkpoints_projector_vg/graph_bootstrap")
     ap.add_argument("--resume_from_checkpoint", type=str, default="", help="Resume full trainer state from this checkpoint.")
     ap.add_argument("--checkpoint_every_n_steps", type=int, default=1000, help="Force-save last.ckpt every N train steps (0 to disable).")
+    ap.add_argument("--manual_stop_file", type=str, default="", help="If this file appears during training, trigger graceful early stop.")
     ap.add_argument("--disable_graph_qa", action="store_true", help="Disable synthetic graph QA from VG scene graphs.")
     ap.add_argument("--graph_qa_max_per_image", type=int, default=3, help="Max synthetic QA pairs per image.")
     ap.add_argument("--graph_qa_repeat", type=int, default=2, help="Repeat factor for synthetic graph QA samples.")
@@ -1020,7 +1072,8 @@ def main():
         save_top_k=1,
         monitor="val_loss",
         mode="min",
-        save_last=True,
+        save_last=False,
+        save_weights_only=True,
     )
     lr_monitor = LearningRateMonitor(logging_interval="step")
     es = EarlyStopping(
@@ -1030,11 +1083,39 @@ def main():
         min_delta=float(args.min_delta),
         verbose=True,
     )
-    callbacks = [ckpt_cb, lr_monitor, es]
+    try:
+        tb_logger = TensorBoardLogger(
+            save_dir=str(save_dir),
+            name="tb_logs",
+            version="",
+        )
+    except ModuleNotFoundError as exc:
+        print(f"[GraphBootstrap][Warn] TensorBoard unavailable, fallback to CSV logger: {exc}")
+        tb_logger = CSVLogger(
+            save_dir=str(save_dir),
+            name="csv_logs",
+            version="",
+        )
+    callbacks = [ckpt_cb, lr_monitor, es, TQDMProgressBar(refresh_rate=10)]
+    manual_stop_file = str(args.manual_stop_file).strip() or str(save_dir / "STOP_EARLY")
+    callbacks.append(
+        ManualEarlyStopByFile(
+            stop_file=manual_stop_file,
+            stage_tag="GraphBootstrap",
+            save_ckpt_path=str(save_dir / "manual_stop.ckpt"),
+        )
+    )
+    print(f"[GraphBootstrap] manual early-stop enabled: touch file -> {manual_stop_file}")
     ckpt_every_n = max(0, int(args.checkpoint_every_n_steps))
     if ckpt_every_n > 0:
         periodic_ckpt_path = save_dir / "last.ckpt"
-        callbacks.append(PeriodicSaveLastCheckpoint(every_n_steps=ckpt_every_n, ckpt_path=str(periodic_ckpt_path)))
+        callbacks.append(
+            PeriodicSaveLastCheckpoint(
+                every_n_steps=ckpt_every_n,
+                ckpt_path=str(periodic_ckpt_path),
+                save_weights_only=True,
+            )
+        )
         print(f"[GraphBootstrap] periodic last.ckpt save enabled: every_n_steps={ckpt_every_n} path={periodic_ckpt_path}")
 
     use_gpu = torch.cuda.is_available() and int(args.gpu) >= 0
@@ -1050,7 +1131,9 @@ def main():
         precision=_parse_precision(args.precision),
         max_steps=int(args.max_steps),
         max_epochs=999999,
+        logger=tb_logger,
         callbacks=callbacks,
+        enable_progress_bar=True,
         log_every_n_steps=10,
         gradient_clip_val=1.0,
         accumulate_grad_batches=max(1, int(args.accumulate_grad_batches)),
@@ -1070,7 +1153,25 @@ def main():
 
     best_path = ckpt_cb.best_model_path or ""
     export_path = save_dir / "model_state_dict.pt"
-    torch.save(pl_model.model.state_dict(), str(export_path))
+    export_saved = False
+    try:
+        torch.save(pl_model.model.state_dict(), str(export_path))
+        export_saved = True
+    except Exception as exc:
+        msg = str(exc).lower()
+        is_enospc = isinstance(exc, OSError) and getattr(exc, "errno", None) == errno.ENOSPC
+        free_bytes = shutil.disk_usage(str(save_dir)).free
+        is_stream_write_fail = isinstance(exc, RuntimeError) and (
+            "pytorchstreamwriter failed writing" in msg
+            or "file write failed" in msg
+            or "unexpected pos" in msg
+            or "no space left on device" in msg
+            or ("cannot be opened" in msg and free_bytes < (512 * 1024 * 1024))
+        )
+        if is_enospc or is_stream_write_fail:
+            print(f"[GraphBootstrap][Warn] skip model_state_dict export (disk full): {export_path}")
+        else:
+            raise
     stage_meta = {
         "stage": "graph_bootstrap",
         "legacy_stage": "stage2A",
@@ -1095,12 +1196,13 @@ def main():
         "alignment_config": pl_model.alignment_config,
         "xtm_stats_summary": pl_model.get_xtm_stats_summary(),
         "best_ckpt": best_path,
-        "export_path": str(export_path),
+        "export_path": (str(export_path) if export_saved else None),
     }
     stage_meta_text = json.dumps(stage_meta, ensure_ascii=False, indent=2)
     (save_dir / "graph_bootstrap_meta.json").write_text(stage_meta_text, encoding="utf-8")
     (save_dir / "stage2A_meta.json").write_text(stage_meta_text, encoding="utf-8")
-    print(f"[GraphBootstrap] exported state_dict -> {export_path}")
+    if export_saved:
+        print(f"[GraphBootstrap] exported state_dict -> {export_path}")
     if best_path:
         print(f"[GraphBootstrap] best ckpt -> {best_path}")
     else:

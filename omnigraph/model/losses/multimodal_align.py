@@ -113,9 +113,10 @@ def mine_hard_negatives(
 
     # Candidates for hard negative.
     valid_hard = (~eye) & (~same_image) & (~near_dup)
-    masked = sim.masked_fill(~valid_hard, -1e9)
+    neg_fill_value = torch.finfo(sim.dtype).min
+    masked = sim.masked_fill(~valid_hard, neg_fill_value)
     row_max, row_argmax = masked.max(dim=1)
-    has_hard = row_max > -1e8
+    has_hard = valid_hard.any(dim=1)
 
     neg_idx[has_hard] = row_argmax[has_hard]
     hard_valid_mask[has_hard] = True

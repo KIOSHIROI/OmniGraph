@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-
+import os
+from typing import Optional
 import argparse
 import json
 import sys
 from pathlib import Path
 from typing import Dict, List, Set
 
-from huggingface_hub import snapshot_download
-
-
 def _resolve_repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
+repo_root = _resolve_repo_root()
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
+from omnigraph.utils.env import setup_env  # pylint: disable=import-outside-toplevel
+
+setup_env()
+
+from huggingface_hub import snapshot_download
 
 def _load_profiles(path: Path) -> Dict[str, Dict[str, str]]:
     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -81,16 +88,7 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="Print model list only.")
     args = ap.parse_args()
 
-    repo_root = _resolve_repo_root()
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
 
-    from omnigraph.utils.env import setup_env  # pylint: disable=import-outside-toplevel
-
-    setup_env(
-        hf_endpoint=(args.hf_endpoint if str(args.hf_endpoint).strip() else None),
-        hf_cache_dir=(args.hf_cache if str(args.hf_cache).strip() else None),
-    )
 
     profiles_path = (repo_root / args.profiles_file).resolve()
     profiles = _load_profiles(profiles_path)
@@ -105,7 +103,7 @@ def main() -> int:
             model_set.add(mm)
 
     if args.include_alt_llm:
-        model_set.add("Qwen/Qwen2.5-3B-Instruct")
+        # model_set.add("Qwen/Qwen2.5-3B-Instruct")
         model_set.add("Qwen/Qwen2.5-7B-Instruct")
     if args.include_legacy_qformer:
         model_set.add("bert-base-uncased")

@@ -261,21 +261,56 @@ def _resolved_paths(repo: Path, run_dir: Path) -> dict[str, str]:
     }
 
 
+def _normalize_thread_env(env: dict[str, str]) -> dict[str, str]:
+    cpu_count = int(os.cpu_count() or 8)
+    default_threads = max(1, min(16, cpu_count // 2 if cpu_count >= 4 else 1))
+    changed: dict[str, str] = {}
+
+    def _is_pos_int(x: str) -> bool:
+        try:
+            return int(str(x).strip()) > 0
+        except Exception:
+            return False
+
+    for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        raw = str(env.get(key, "")).strip()
+        if not _is_pos_int(raw):
+            changed[key] = raw or "<unset>"
+            env[key] = str(default_threads)
+
+    for key in ("OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        raw = str(env.get(key, "")).strip()
+        if not _is_pos_int(raw):
+            env[key] = str(env.get("OMP_NUM_THREADS", default_threads))
+
+    return changed
+
+
 def _run_and_tee(cmd: list[str], env: dict[str, str], log_path: Path, append: bool = False) -> int:
-    mode = "a" if append else "w"
-    with log_path.open(mode, encoding="utf-8") as fp:
+    mode = "ab" if append else "wb"
+    with log_path.open(mode) as fp:
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+            text=False,
+            bufsize=0,
             env=env,
         )
         assert proc.stdout is not None
-        for line in proc.stdout:
-            sys.stdout.write(line)
-            fp.write(line)
+        out = proc.stdout
+        while True:
+            chunk = out.read(8192)
+            if not chunk:
+                break
+            if hasattr(sys.stdout, "buffer"):
+                sys.stdout.buffer.write(chunk)
+                sys.stdout.flush()
+            else:
+                sys.stdout.write(chunk.decode("utf-8", errors="replace"))
+                sys.stdout.flush()
+            fp.write(chunk)
+            fp.flush()
         return proc.wait()
 
 
@@ -340,7 +375,7 @@ def main() -> int:
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--run-name", type=str, default="")
     parser.add_argument("--run-id", type=str, default="", help="Explicit run id (for deterministic naming/resume)")
-    parser.add_argument("--output-root", type=str, default="runs")
+    parser.add_argument("--output-root", type=str, default="/root/autodl-tmp/omnigraph_runs")
     parser.add_argument("--profiles-file", type=str, default="configs/train/infra_profiles.json")
     parser.add_argument("--data-config", type=str, default="", help="JSON file with fine-grained data path overrides.")
     parser.add_argument("--set", dest="sets", action="append", default=[], help="Override env as KEY=VALUE")
@@ -432,6 +467,7 @@ def main() -> int:
     env["PIPELINE_MODE"] = resolved_mode
     env["RUN_ID"] = run_id
     env.update(overrides)
+    normalized_thread_env = _normalize_thread_env(env)
 
     git = _git_info(repo)
     if args.require_clean_git and git.get("dirty"):
@@ -441,6 +477,10 @@ def main() -> int:
         print("[Infra] resolved env:")
         for key in sorted(set(profile_env.keys()) | set(resolved_paths.keys()) | set(data_overrides.keys()) | set(overrides.keys()) | {"GPU", "PIPELINE_MODE", "RUN_ID"}):
             print(f"{key}={env[key]}")
+
+    if normalized_thread_env:
+        for k, old_v in normalized_thread_env.items():
+            print(f"[Infra][Warn] invalid {k}={old_v}; normalized to {env[k]}")
 
     if resolved_mode == "stage1":
         command = ["bash", str((repo / "train_stage1.sh").resolve())]
@@ -511,7 +551,17 @@ def main() -> int:
         "log": str(log_path),
         "manifest": str(manifest_path),
     }
-    status_path.write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
+    status_text = json.dumps(status, ensure_ascii=False, indent=2)
+    try:
+        status_path.write_text(status_text, encoding="utf-8")
+    except OSError as exc:
+        if getattr(exc, "errno", None) == 28:
+            fallback_status = Path(f"/tmp/omnigraph_run_status_{run_id}.json")
+            fallback_status.write_text(status_text, encoding="utf-8")
+            print(f"[Infra][Warn] no space left while writing status file: {status_path}")
+            print(f"[Infra][Warn] wrote fallback status to: {fallback_status}")
+        else:
+            raise
     print(f"[Infra] exit_code={rc}")
     return rc
 

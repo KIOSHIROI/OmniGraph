@@ -26,7 +26,8 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from transformers import AutoTokenizer, AutoProcessor
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping, TQDMProgressBar
+from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger
 
 from torch_geometric.data import Batch as GeoBatch
 
@@ -769,6 +770,33 @@ class PeriodicSaveLastCheckpoint(pl.Callback):
         trainer.save_checkpoint(self.ckpt_path)
 
 
+class ManualEarlyStopByFile(pl.Callback):
+    """Allow manual early-stop by creating a signal file during training."""
+
+    def __init__(self, stop_file: str, stage_tag: str, save_ckpt_path: Optional[str] = None):
+        super().__init__()
+        self.stop_file = str(stop_file)
+        self.stage_tag = str(stage_tag)
+        self.save_ckpt_path = str(save_ckpt_path) if save_ckpt_path else ""
+        self._triggered = False
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):  # type: ignore[override]
+        if self._triggered:
+            return
+        if not Path(self.stop_file).exists():
+            return
+        step = int(getattr(trainer, "global_step", 0))
+        print(f"[{self.stage_tag}] manual early-stop signal detected: {self.stop_file} (step={step})")
+        if self.save_ckpt_path:
+            try:
+                trainer.save_checkpoint(self.save_ckpt_path)
+                print(f"[{self.stage_tag}] saved manual-stop checkpoint: {self.save_ckpt_path}")
+            except Exception as exc:
+                print(f"[{self.stage_tag}][Warn] failed to save manual-stop checkpoint: {exc}")
+        trainer.should_stop = True
+        self._triggered = True
+
+
 # ---------------------------------------------------------------------------
 # Entry
 # ---------------------------------------------------------------------------
@@ -836,6 +864,7 @@ def main():
     ap.add_argument("--save_dir", type=str, default="checkpoints_multimodal_tune")
     ap.add_argument("--resume_from_checkpoint", type=str, default="", help="Resume full trainer state from this checkpoint.")
     ap.add_argument("--checkpoint_every_n_steps", type=int, default=1000, help="Force-save last.ckpt every N train steps (0 to disable).")
+    ap.add_argument("--manual_stop_file", type=str, default="", help="If this file appears during training, trigger graceful early stop.")
 
     ap.add_argument("--min_freq", type=int, default=2)
     ap.add_argument("--max_nodes", type=int, default=80)
@@ -1033,7 +1062,29 @@ def main():
         min_delta=float(args.min_delta),
         verbose=True,
     )
-    callbacks = [ckpt_cb, lr_monitor, es]
+    try:
+        tb_logger = TensorBoardLogger(
+            save_dir=str(save_dir),
+            name="tb_logs",
+            version="",
+        )
+    except ModuleNotFoundError as exc:
+        print(f"[MultiModalTune][Warn] TensorBoard unavailable, fallback to CSV logger: {exc}")
+        tb_logger = CSVLogger(
+            save_dir=str(save_dir),
+            name="csv_logs",
+            version="",
+        )
+    callbacks = [ckpt_cb, lr_monitor, es, TQDMProgressBar(refresh_rate=10)]
+    manual_stop_file = str(args.manual_stop_file).strip() or str(save_dir / "STOP_EARLY")
+    callbacks.append(
+        ManualEarlyStopByFile(
+            stop_file=manual_stop_file,
+            stage_tag="MultiModalTune",
+            save_ckpt_path=str(save_dir / "manual_stop.ckpt"),
+        )
+    )
+    print(f"[MultiModalTune] manual early-stop enabled: touch file -> {manual_stop_file}")
     ckpt_every_n = max(0, int(args.checkpoint_every_n_steps))
     if ckpt_every_n > 0:
         periodic_ckpt_path = save_dir / "last.ckpt"
@@ -1053,7 +1104,9 @@ def main():
         precision=_parse_precision(args.precision),
         max_steps=int(args.max_steps),
         max_epochs=999999,  # controlled by max_steps + early stopping
+        logger=tb_logger,
         callbacks=callbacks,
+        enable_progress_bar=True,
         log_every_n_steps=10,
         gradient_clip_val=1.0,
         accumulate_grad_batches=max(1, int(args.accumulate_grad_batches)),
