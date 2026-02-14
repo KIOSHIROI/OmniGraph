@@ -10,6 +10,27 @@ python scripts/train/infra_launcher.py --profile 4090 --mode full --gpu 0
 python scripts/train/infra_launcher.py --profile pro6000 --mode full --gpu 0
 ```
 
+If data is not under `<repo>/data`, set one root and keep all VG/GQA defaults derived from it:
+
+```bash
+python scripts/train/infra_launcher.py --profile pro6000 --mode full --gpu 0 \
+  --set OMNIGRAPH_DATA_ROOT=/absolute/path/to/data
+```
+
+For fine-grained per-file path control, use a JSON data config:
+
+```bash
+python scripts/train/infra_launcher.py --profile pro6000 --mode full --gpu 0 \
+  --data-config configs/train/data_paths.sample.json
+```
+
+You can validate profile + data config without running:
+
+```bash
+python scripts/train/infra_launcher.py --profile pro6000 --validate-only \
+  --data-config configs/train/data_paths.sample.json
+```
+
 ## Prefetch models (new server)
 
 Prefetch all model repos needed by current profile (LLM + vision + stage1 text encoder), plus optional alternates:

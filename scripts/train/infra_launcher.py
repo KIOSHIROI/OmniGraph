@@ -39,6 +39,24 @@ PROFILE_ENUM_KEYS = {
     "STAGE2A_BOOTSTRAP_MODE": {"auto", "no_stage1", "legacy_stage1"},
     "NODE_ENCODER_TYPE": {"legacy_vg", "open_vocab", "hybrid"},
 }
+DATA_PATH_KEYS = {
+    "OMNIGRAPH_DATA_ROOT",
+    "VG_SCENE_GRAPHS",
+    "VG_REGIONS",
+    "VG_IMAGE_ROOT",
+    "EXTRA_SCENE_GRAPHS",
+    "STAGE1_QFORMER_CKPT",
+    "GRAPH_TOKENIZER_PRETRAIN_CKPT",
+    "GQA_QUESTIONS_JSON",
+    "GQA_QUESTIONS_JSONL",
+    "GQA_SCENE_RAW",
+    "GQA_SCENE_VG",
+    "GQA_IMAGE_ROOT",
+    "GQA_PRED_PAPER",
+    "GQA_EVAL_PAPER",
+    "GQA_PRED_R2",
+    "GQA_EVAL_R2",
+}
 
 
 def _parse_kv(items: list[str]) -> dict[str, str]:
@@ -158,6 +176,37 @@ def _validate_profile_env(profile_name: str, env_map: dict[str, str]) -> tuple[l
     if bootstrap == "no_stage1" and tokenizer == "qformer":
         warnings.append(f"[{profile_name}] qformer + no_stage1 will train tokenizer from scratch")
     return errors, warnings
+
+
+def _load_data_overrides(path: Path) -> dict[str, str]:
+    obj = _read_json_no_conflict(path)
+    node = obj.get("env") if isinstance(obj.get("env"), dict) else obj
+    if not isinstance(node, dict):
+        raise ValueError(f"Invalid data config: {path}. Expected a JSON object (or an 'env' object).")
+
+    out: dict[str, str] = {}
+    unknown: list[str] = []
+    for key, value in node.items():
+        if not isinstance(key, str):
+            continue
+        if key.startswith("_"):
+            continue
+        if key not in DATA_PATH_KEYS:
+            unknown.append(key)
+            continue
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        out[key] = text
+
+    if unknown:
+        raise ValueError(
+            f"Unknown keys in data config {path}: {', '.join(sorted(unknown))}. "
+            f"Allowed keys: {', '.join(sorted(DATA_PATH_KEYS))}"
+        )
+    return out
 
 
 def _normalize_mode(mode: str) -> str:
@@ -293,6 +342,7 @@ def main() -> int:
     parser.add_argument("--run-id", type=str, default="", help="Explicit run id (for deterministic naming/resume)")
     parser.add_argument("--output-root", type=str, default="runs")
     parser.add_argument("--profiles-file", type=str, default="configs/train/infra_profiles.json")
+    parser.add_argument("--data-config", type=str, default="", help="JSON file with fine-grained data path overrides.")
     parser.add_argument("--set", dest="sets", action="append", default=[], help="Override env as KEY=VALUE")
     parser.add_argument("--list-profiles", action="store_true", help="List available profiles and exit")
     parser.add_argument("--validate-only", action="store_true", help="Validate profile and exit")
@@ -325,8 +375,23 @@ def main() -> int:
         print(f"[Infra][Warn] {warning}")
     if profile_errors:
         raise ValueError("Profile validation failed:\n" + "\n".join(f"- {msg}" for msg in profile_errors))
+
+    data_overrides: dict[str, str] = {}
+    data_config_path: Path | None = None
+    if str(args.data_config).strip():
+        raw_data_cfg = Path(str(args.data_config).strip())
+        data_config_path = raw_data_cfg if raw_data_cfg.is_absolute() else (repo / raw_data_cfg)
+        data_config_path = data_config_path.resolve()
+        if not data_config_path.exists():
+            raise FileNotFoundError(f"Data config not found: {data_config_path}")
+        data_overrides = _load_data_overrides(data_config_path)
+
     if args.validate_only and not args.print_resolved_env and not args.dry_run:
-        print(f"[Infra] profile '{args.profile}' validation passed.")
+        if data_config_path:
+            print(f"[Infra] profile '{args.profile}' + data config validation passed.")
+            print(f"[Infra] data_config={data_config_path}")
+        else:
+            print(f"[Infra] profile '{args.profile}' validation passed.")
         return 0
 
     overrides = _parse_kv(args.sets)
@@ -361,6 +426,7 @@ def main() -> int:
     env.update(profile_env)
     resolved_paths = _resolved_paths(repo, run_dir)
     env.update(resolved_paths)
+    env.update(data_overrides)
     env["GPU"] = str(args.gpu)
     resolved_mode = _normalize_mode(args.mode)
     env["PIPELINE_MODE"] = resolved_mode
@@ -373,7 +439,7 @@ def main() -> int:
 
     if args.print_resolved_env:
         print("[Infra] resolved env:")
-        for key in sorted(set(profile_env.keys()) | set(resolved_paths.keys()) | set(overrides.keys()) | {"GPU", "PIPELINE_MODE", "RUN_ID"}):
+        for key in sorted(set(profile_env.keys()) | set(resolved_paths.keys()) | set(data_overrides.keys()) | set(overrides.keys()) | {"GPU", "PIPELINE_MODE", "RUN_ID"}):
             print(f"{key}={env[key]}")
 
     if resolved_mode == "stage1":
@@ -382,7 +448,7 @@ def main() -> int:
         command = ["bash", str((repo / "scripts/train/run_4090_gqa_sprint.sh").resolve())]
     cmd_str = " ".join(shlex.quote(x) for x in command)
 
-    tracked_env_keys = sorted(set(profile_env.keys()) | set(resolved_paths.keys()) | set(overrides.keys()) | {"GPU", "PIPELINE_MODE", "RUN_ID"})
+    tracked_env_keys = sorted(set(profile_env.keys()) | set(resolved_paths.keys()) | set(data_overrides.keys()) | set(overrides.keys()) | {"GPU", "PIPELINE_MODE", "RUN_ID"})
     now = datetime.now().isoformat(timespec="seconds")
     command_file = run_dir / ("command_resume.sh" if args.resume else "command.sh")
     manifest_path = run_dir / ("run_manifest_resume.json" if args.resume else "run_manifest.json")
@@ -399,7 +465,9 @@ def main() -> int:
         "repo": str(repo),
         "command": cmd_str,
         "profiles_file": str(profiles_path),
+        "data_config_file": (str(data_config_path) if data_config_path else None),
         "profile_env": profile_env,
+        "data_overrides": data_overrides,
         "overrides": overrides,
         "resolved_env": {k: env[k] for k in tracked_env_keys},
         "git": git,

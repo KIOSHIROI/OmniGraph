@@ -304,9 +304,10 @@ fi
 : "${S3_R2_LR:=8e-6}"
 : "${S3_R2_MAX_STEPS:=50000}"
 
-VG_SCENE_GRAPHS=${VG_SCENE_GRAPHS:-"$REPO/data/vg/contents/sceneGraphs/scene_graphs.json"}
-VG_REGIONS=${VG_REGIONS:-"$REPO/data/vg/contents/regionDescriptions/region_descriptions.json"}
-VG_IMAGE_ROOT=${VG_IMAGE_ROOT:-"$REPO/data/vg"}
+OMNIGRAPH_DATA_ROOT=${OMNIGRAPH_DATA_ROOT:-"$REPO/data"}
+VG_SCENE_GRAPHS=${VG_SCENE_GRAPHS:-"$OMNIGRAPH_DATA_ROOT/vg/contents/sceneGraphs/scene_graphs.json"}
+VG_REGIONS=${VG_REGIONS:-"$OMNIGRAPH_DATA_ROOT/vg/contents/regionDescriptions/region_descriptions.json"}
+VG_IMAGE_ROOT=${VG_IMAGE_ROOT:-"$OMNIGRAPH_DATA_ROOT/vg"}
 STAGE1_QFORMER_CKPT=${STAGE1_QFORMER_CKPT:-"$REPO/graph_qformer_stage1.pt"}
 EXTRA_SCENE_GRAPHS=${EXTRA_SCENE_GRAPHS:-""}
 if [ -n "${GRAPH_TOKENIZER_PRETRAIN_CKPT:-}" ]; then
@@ -333,15 +334,15 @@ if [ -n "${MULTIMODAL_TUNE_DIR:-}" ]; then STAGE3_DIR="${MULTIMODAL_TUNE_DIR}"; 
 if [ -n "${GRAPH_REFINE_R2_DIR:-}" ]; then STAGE2B_R2_DIR="${GRAPH_REFINE_R2_DIR}"; fi
 if [ -n "${MULTIMODAL_TUNE_R2_DIR:-}" ]; then STAGE3_R2_DIR="${MULTIMODAL_TUNE_R2_DIR}"; fi
 
-GQA_QUESTIONS_JSON=${GQA_QUESTIONS_JSON:-"$REPO/data/gqa/contents/questions/val_balanced_questions.json"}
-GQA_QUESTIONS_JSONL=${GQA_QUESTIONS_JSONL:-"$REPO/data/gqa/val_balanced.jsonl"}
-GQA_SCENE_RAW=${GQA_SCENE_RAW:-"$REPO/data/gqa/contents/sceneGraphs/val_sceneGraphs.json"}
-GQA_SCENE_VG=${GQA_SCENE_VG:-"$REPO/data/gqa/scene_graphs_val_vg.json"}
-GQA_IMAGE_ROOT=${GQA_IMAGE_ROOT:-"$REPO/data/gqa/contents/images"}
-GQA_PRED_PAPER=${GQA_PRED_PAPER:-"$REPO/data/gqa/pred_val_balanced_paper.jsonl"}
-GQA_EVAL_PAPER=${GQA_EVAL_PAPER:-"$REPO/data/gqa/eval_val_balanced_paper.txt"}
-GQA_PRED_R2=${GQA_PRED_R2:-"$REPO/data/gqa/pred_val_balanced_round2.jsonl"}
-GQA_EVAL_R2=${GQA_EVAL_R2:-"$REPO/data/gqa/eval_val_balanced_round2.txt"}
+GQA_QUESTIONS_JSON=${GQA_QUESTIONS_JSON:-"$OMNIGRAPH_DATA_ROOT/gqa/contents/questions/val_balanced_questions.json"}
+GQA_QUESTIONS_JSONL=${GQA_QUESTIONS_JSONL:-"$OMNIGRAPH_DATA_ROOT/gqa/val_balanced.jsonl"}
+GQA_SCENE_RAW=${GQA_SCENE_RAW:-"$OMNIGRAPH_DATA_ROOT/gqa/contents/sceneGraphs/val_sceneGraphs.json"}
+GQA_SCENE_VG=${GQA_SCENE_VG:-"$OMNIGRAPH_DATA_ROOT/gqa/scene_graphs_val_vg.json"}
+GQA_IMAGE_ROOT=${GQA_IMAGE_ROOT:-"$OMNIGRAPH_DATA_ROOT/gqa/contents/images"}
+GQA_PRED_PAPER=${GQA_PRED_PAPER:-"$OMNIGRAPH_DATA_ROOT/gqa/pred_val_balanced_paper.jsonl"}
+GQA_EVAL_PAPER=${GQA_EVAL_PAPER:-"$OMNIGRAPH_DATA_ROOT/gqa/eval_val_balanced_paper.txt"}
+GQA_PRED_R2=${GQA_PRED_R2:-"$OMNIGRAPH_DATA_ROOT/gqa/pred_val_balanced_round2.jsonl"}
+GQA_EVAL_R2=${GQA_EVAL_R2:-"$OMNIGRAPH_DATA_ROOT/gqa/eval_val_balanced_round2.txt"}
 
 SELECT_CKPT="${REPO}/scripts/train/select_best_ckpt.py"
 STAGE2A_CKPT=${STAGE2A_CKPT:-}

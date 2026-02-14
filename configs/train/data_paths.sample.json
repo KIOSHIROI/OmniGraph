@@ -1,0 +1,19 @@
+{
+  "_description": "Fine-grained data path overrides for scripts/train/infra_launcher.py --data-config",
+  "OMNIGRAPH_DATA_ROOT": "/data/omnigraph_data",
+  "VG_SCENE_GRAPHS": "/data/omnigraph_data/vg/contents/sceneGraphs/scene_graphs.json",
+  "VG_REGIONS": "/data/omnigraph_data/vg/contents/regionDescriptions/region_descriptions.json",
+  "VG_IMAGE_ROOT": "/data/omnigraph_data/vg",
+  "EXTRA_SCENE_GRAPHS": "/data/omnigraph_data/vg_pseudo/pseudo_scene_graphs_round1.json,/data/omnigraph_data/vg_pseudo/pseudo_scene_graphs_round2.json",
+  "GQA_QUESTIONS_JSON": "/data/omnigraph_data/gqa/contents/questions/val_balanced_questions.json",
+  "GQA_QUESTIONS_JSONL": "/data/omnigraph_data/gqa/val_balanced.jsonl",
+  "GQA_SCENE_RAW": "/data/omnigraph_data/gqa/contents/sceneGraphs/val_sceneGraphs.json",
+  "GQA_SCENE_VG": "/data/omnigraph_data/gqa/scene_graphs_val_vg.json",
+  "GQA_IMAGE_ROOT": "/data/omnigraph_data/gqa/contents/images",
+  "GQA_PRED_PAPER": "/data/omnigraph_data/gqa/pred_val_balanced_paper.jsonl",
+  "GQA_EVAL_PAPER": "/data/omnigraph_data/gqa/eval_val_balanced_paper.txt",
+  "GQA_PRED_R2": "/data/omnigraph_data/gqa/pred_val_balanced_round2.jsonl",
+  "GQA_EVAL_R2": "/data/omnigraph_data/gqa/eval_val_balanced_round2.txt",
+  "STAGE1_QFORMER_CKPT": "/data/omnigraph_ckpt/graph_qformer_stage1.pt",
+  "GRAPH_TOKENIZER_PRETRAIN_CKPT": "/data/omnigraph_ckpt/graph_qformer_stage1.pt"
+}
