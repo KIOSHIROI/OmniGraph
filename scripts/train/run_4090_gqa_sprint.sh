@@ -50,6 +50,24 @@ ensure_positive_int_env MKL_NUM_THREADS "$THREAD_DEFAULT"
 ensure_positive_int_env OPENBLAS_NUM_THREADS "$OMP_NUM_THREADS"
 ensure_positive_int_env NUMEXPR_NUM_THREADS "$OMP_NUM_THREADS"
 
+normalize_precision_for_dtype() {
+  local precision="${1:-16-mixed}"
+  local dtype="${2:-bfloat16}"
+  local p
+  local d
+  p="$(printf "%s" "$precision" | tr '[:upper:]' '[:lower:]')"
+  d="$(printf "%s" "$dtype" | tr '[:upper:]' '[:lower:]')"
+  if { [ "$d" = "bfloat16" ] || [ "$d" = "bf16" ]; } && { [ "$p" = "16" ] || [ "$p" = "16-mixed" ]; }; then
+    echo "bf16-mixed"
+    return
+  fi
+  if { [ "$d" = "float16" ] || [ "$d" = "fp16" ] || [ "$d" = "half" ]; } && { [ "$p" = "bf16" ] || [ "$p" = "bf16-mixed" ]; }; then
+    echo "16-mixed"
+    return
+  fi
+  echo "$precision"
+}
+
 STRICT_TARGET=${STRICT_TARGET:-0.4200}
 STRICT_SPRINT_TARGET=${STRICT_SPRINT_TARGET:-0.4400}
 STRICT_BASELINE=${STRICT_BASELINE:-0.3912}
@@ -368,6 +386,20 @@ fi
 : "${S3_R2_MIN_DELTA:=0.0002}"
 : "${S3_R2_LR:=8e-6}"
 : "${S3_R2_MAX_STEPS:=50000}"
+
+S2A_PRECISION_ORIG="$S2A_PRECISION"
+S2B_PRECISION_ORIG="$S2B_PRECISION"
+S3_PRECISION_ORIG="$S3_PRECISION"
+S2B_R2_PRECISION_ORIG="$S2B_R2_PRECISION"
+S3_R2_PRECISION_ORIG="$S3_R2_PRECISION"
+S2A_PRECISION="$(normalize_precision_for_dtype "$S2A_PRECISION" "$LLM_DTYPE")"
+S2B_PRECISION="$(normalize_precision_for_dtype "$S2B_PRECISION" "$LLM_DTYPE")"
+S3_PRECISION="$(normalize_precision_for_dtype "$S3_PRECISION" "$LLM_DTYPE")"
+S2B_R2_PRECISION="$(normalize_precision_for_dtype "$S2B_R2_PRECISION" "$LLM_DTYPE")"
+S3_R2_PRECISION="$(normalize_precision_for_dtype "$S3_R2_PRECISION" "$LLM_DTYPE")"
+if [ "$S2A_PRECISION" != "$S2A_PRECISION_ORIG" ] || [ "$S2B_PRECISION" != "$S2B_PRECISION_ORIG" ] || [ "$S3_PRECISION" != "$S3_PRECISION_ORIG" ] || [ "$S2B_R2_PRECISION" != "$S2B_R2_PRECISION_ORIG" ] || [ "$S3_R2_PRECISION" != "$S3_R2_PRECISION_ORIG" ]; then
+  echo "[ConfigFix] precision adjusted for LLM_DTYPE=$LLM_DTYPE -> S2A=$S2A_PRECISION S2B=$S2B_PRECISION S3=$S3_PRECISION S2B_R2=$S2B_R2_PRECISION S3_R2=$S3_R2_PRECISION"
+fi
 
 OMNIGRAPH_DATA_ROOT=${OMNIGRAPH_DATA_ROOT:-"$REPO/data"}
 VG_SCENE_GRAPHS=${VG_SCENE_GRAPHS:-"$OMNIGRAPH_DATA_ROOT/vg/contents/sceneGraphs/scene_graphs.json"}

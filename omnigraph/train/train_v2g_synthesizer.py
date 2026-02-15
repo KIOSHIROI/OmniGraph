@@ -39,6 +39,16 @@ def _parse_precision(x: str):
     return "16-mixed"
 
 
+def _normalize_precision_with_dtype(precision: str, torch_dtype: str) -> str:
+    p = str(_parse_precision(precision)).strip().lower()
+    d = str(torch_dtype).strip().lower()
+    if d in {"bfloat16", "bf16"} and p in {"16", "16-mixed"}:
+        return "bf16-mixed"
+    if d in {"float16", "fp16", "half"} and p in {"bf16", "bf16-mixed"}:
+        return "16-mixed"
+    return p
+
+
 def _read_jsonl(path: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     p = Path(path)
@@ -258,6 +268,16 @@ def main() -> int:
     ap.add_argument("--save_dir", required=True)
 
     args = ap.parse_args()
+    normalized_precision = _normalize_precision_with_dtype(
+        precision=str(args.precision),
+        torch_dtype=str(args.torch_dtype),
+    )
+    if str(normalized_precision) != str(args.precision).strip().lower():
+        print(
+            "[V2G][ConfigFix] precision adjusted for torch_dtype: "
+            f"{args.precision} + {args.torch_dtype} -> {normalized_precision}"
+        )
+    args.precision = normalized_precision
 
     if int(args.lora_r) > 0:
         print("[V2G] lora_r > 0 requested, but this script currently uses projector/qformer-style lightweight tuning.")

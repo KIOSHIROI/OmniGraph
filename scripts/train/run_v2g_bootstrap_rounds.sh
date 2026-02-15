@@ -83,6 +83,30 @@ FILTER_SCORE_THRESH=${FILTER_SCORE_THRESH:-0.72}
 
 mkdir -p "$V2G_DIR" "$PSEUDO_DIR"
 
+normalize_precision_for_dtype() {
+  local precision="${1:-16-mixed}"
+  local dtype="${2:-bfloat16}"
+  local p
+  local d
+  p="$(printf "%s" "$precision" | tr '[:upper:]' '[:lower:]')"
+  d="$(printf "%s" "$dtype" | tr '[:upper:]' '[:lower:]')"
+  if { [ "$d" = "bfloat16" ] || [ "$d" = "bf16" ]; } && { [ "$p" = "16" ] || [ "$p" = "16-mixed" ]; }; then
+    echo "bf16-mixed"
+    return
+  fi
+  if { [ "$d" = "float16" ] || [ "$d" = "fp16" ] || [ "$d" = "half" ]; } && { [ "$p" = "bf16" ] || [ "$p" = "bf16-mixed" ]; }; then
+    echo "16-mixed"
+    return
+  fi
+  echo "$precision"
+}
+
+V2G_PRECISION_ORIG="$V2G_PRECISION"
+V2G_PRECISION="$(normalize_precision_for_dtype "$V2G_PRECISION" "$V2G_TORCH_DTYPE")"
+if [ "$V2G_PRECISION" != "$V2G_PRECISION_ORIG" ]; then
+  echo "[ConfigFix] V2G precision adjusted: $V2G_PRECISION_ORIG + $V2G_TORCH_DTYPE -> $V2G_PRECISION"
+fi
+
 if [ "$AUTO_BUILD_MANIFESTS" = "1" ]; then
   if [ ! -f "$V2G_TRAIN_MANIFEST" ] || [ ! -f "$VT_MANIFEST_R1" ] || [ ! -f "$VT_MANIFEST_R2" ]; then
     echo "[Manifest] missing files detected, auto-building manifests..."
