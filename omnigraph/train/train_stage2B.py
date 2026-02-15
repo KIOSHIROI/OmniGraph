@@ -180,7 +180,11 @@ def split_by_image_id(
 # ---------------------------------------------------------------------------
 # Collate
 # ---------------------------------------------------------------------------
-def collate_graph_text(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+def collate_graph_text(
+    batch: List[Dict[str, Any]],
+    tokenizer: Optional[Any] = None,
+    max_length: Optional[int] = None,
+) -> Dict[str, Any]:
     from torch_geometric.data import Batch as GeoBatch
 
     ids: List[str] = []
@@ -199,7 +203,7 @@ def collate_graph_text(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         graphs.append(item["graph_data"])
 
     batch_graph = GeoBatch.from_data_list(graphs)
-    return {
+    out = {
         "ids": ids,
         "image_ids": image_ids,
         "graph_data": batch_graph,
@@ -207,6 +211,18 @@ def collate_graph_text(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "answer": answers,
         "qa_type": qa_types,
     }
+    if tokenizer is not None and max_length is not None and int(max_length) > 0:
+        input_ids, attention_mask, labels = build_chat_inputs_and_labels(
+            tokenizer=tokenizer,
+            prompts=texts,
+            answers=answers,
+            device=None,
+            max_length=int(max_length),
+        )
+        out["input_ids"] = input_ids
+        out["attention_mask"] = attention_mask
+        out["labels"] = labels
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +248,7 @@ class Stage2BProjectorPL(pl.LightningModule):
         max_graph_tokens: int | None = None,
         llm_dtype: str = "bfloat16",
         llm_attn_implementation: str = "sdpa",
+        enable_llm_gradient_checkpointing: bool = True,
         graph_tokenizer_type: str = "qformer",
         perceiver_num_latents: int = 32,
         perceiver_num_layers: int = 3,
@@ -300,6 +317,7 @@ class Stage2BProjectorPL(pl.LightningModule):
         }
         self._xtm_stats_accum: Dict[str, float] = init_xtm_stats_accum()
         self.stage2A_bootstrap = stage2A_bootstrap or {}
+        self.enable_llm_gradient_checkpointing = bool(enable_llm_gradient_checkpointing)
 
         # trainable params (Stage2-B)
         self.train_node_encoder = bool(train_node_encoder)
@@ -319,11 +337,16 @@ class Stage2BProjectorPL(pl.LightningModule):
             f"train_node_encoder={self.train_node_encoder}"
         )
 
-        # LLM config
-        if hasattr(self.model.llm.model, "gradient_checkpointing_enable"):
-            self.model.llm.model.gradient_checkpointing_enable()
+        # LLM memory-saving / speed trade-off
+        if self.enable_llm_gradient_checkpointing:
+            if hasattr(self.model.llm.model, "gradient_checkpointing_enable"):
+                self.model.llm.model.gradient_checkpointing_enable()
+        else:
+            if hasattr(self.model.llm.model, "gradient_checkpointing_disable"):
+                self.model.llm.model.gradient_checkpointing_disable()
         if hasattr(self.model.llm.model, "config"):
             self.model.llm.model.config.use_cache = False
+        print(f"[Stage2B] llm_gradient_checkpointing={self.enable_llm_gradient_checkpointing}")
 
         self.tokenizer = AutoTokenizer.from_pretrained(llm_model_name)
         if self.tokenizer.pad_token is None:
@@ -356,13 +379,18 @@ class Stage2BProjectorPL(pl.LightningModule):
         answers: List[str] = batch["answer"]
         qa_types: List[str] = batch.get("qa_type", ["unknown"] * len(prompts))
 
-        input_ids, attention_mask, labels = build_chat_inputs_and_labels(
-            tokenizer=self.tokenizer,
-            prompts=prompts,
-            answers=answers,
-            device=self.device,
-            max_length=self.max_length,
-        )
+        if "input_ids" in batch and "attention_mask" in batch and "labels" in batch:
+            input_ids = batch["input_ids"].to(self.device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
+            labels = batch["labels"].to(self.device, non_blocking=True)
+        else:
+            input_ids, attention_mask, labels = build_chat_inputs_and_labels(
+                tokenizer=self.tokenizer,
+                prompts=prompts,
+                answers=answers,
+                device=self.device,
+                max_length=self.max_length,
+            )
         aux_binary_labels, aux_binary_mask = build_binary_aux_targets(
             qa_types=qa_types,
             answers=answers,
@@ -635,6 +663,7 @@ def main():
     ap.add_argument("--precision", type=str, default="32")
     ap.add_argument("--llm_dtype", type=str, default="bfloat16", help="LLM load dtype: bfloat16/float16/float32.")
     ap.add_argument("--llm_attn_implementation", type=str, default="sdpa", help="LLM attention backend (e.g., sdpa/flash_attention_2).")
+    ap.add_argument("--enable_llm_gradient_checkpointing", type=int, default=1, choices=[0, 1], help="Enable LLM gradient checkpointing.")
     ap.add_argument("--graph_tokenizer_type", type=str, default="auto", choices=["auto", "qformer", "perceiver"])
     ap.add_argument("--perceiver_num_latents", type=int, default=-1, help="<=0 means inherit from GraphBootstrap provenance.")
     ap.add_argument("--perceiver_num_layers", type=int, default=-1, help="<=0 means inherit from GraphBootstrap provenance.")
@@ -681,6 +710,7 @@ def main():
     ap.add_argument("--limit_val_batches", type=float, default=1.0)
     ap.add_argument("--num_sanity_val_steps", type=int, default=0)
     ap.add_argument("--accumulate_grad_batches", type=int, default=4)
+    ap.add_argument("--prefetch_factor", type=int, default=4, help="DataLoader prefetch_factor when num_workers > 0.")
     args = ap.parse_args()
     resume_ckpt = str(args.resume_from_checkpoint).strip()
     if resume_ckpt and not Path(resume_ckpt).exists():
@@ -781,13 +811,30 @@ def main():
     if overlap:
         raise RuntimeError(f"Leakage detected in GraphRefine split: overlap image_ids={list(sorted(overlap))[:10]}")
 
+    tokenizer_for_collate = AutoTokenizer.from_pretrained(args.llm, use_fast=True)
+    if tokenizer_for_collate.pad_token is None:
+        tokenizer_for_collate.pad_token = tokenizer_for_collate.eos_token
+    max_length_for_collate = min(
+        int(getattr(tokenizer_for_collate, "model_max_length", 2048)),
+        int(args.max_length),
+    )
+
+    def _collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        return collate_graph_text(
+            batch=batch,
+            tokenizer=tokenizer_for_collate,
+            max_length=max_length_for_collate,
+        )
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
-        collate_fn=collate_graph_text,
+        persistent_workers=(int(args.num_workers) > 0),
+        prefetch_factor=(int(args.prefetch_factor) if int(args.num_workers) > 0 else None),
+        collate_fn=_collate,
     )
     val_loader = DataLoader(
         val_ds,
@@ -795,7 +842,9 @@ def main():
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
-        collate_fn=collate_graph_text,
+        persistent_workers=(int(args.num_workers) > 0),
+        prefetch_factor=(int(args.prefetch_factor) if int(args.num_workers) > 0 else None),
+        collate_fn=_collate,
     )
     vci = _parse_val_check_interval(args.val_check_interval)
 
@@ -814,6 +863,7 @@ def main():
         max_graph_tokens=(int(args.max_graph_tokens) if int(args.max_graph_tokens) > 0 else None),
         llm_dtype=str(args.llm_dtype),
         llm_attn_implementation=str(args.llm_attn_implementation),
+        enable_llm_gradient_checkpointing=bool(int(args.enable_llm_gradient_checkpointing)),
         graph_tokenizer_type=str(resolved_graph_tokenizer_config.get("type")),
         perceiver_num_latents=int(resolved_graph_tokenizer_config.get("num_latents", 32)),
         perceiver_num_layers=int(resolved_graph_tokenizer_config.get("num_layers", 3)),

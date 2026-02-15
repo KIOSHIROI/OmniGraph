@@ -338,7 +338,12 @@ def split_by_image_id(dataset: VGTriModalRegionDataset, val_ratio: float, seed: 
 # Collate
 # ---------------------------------------------------------------------------
 
-def collate_tri(batch: List[Dict[str, Any]], processor: Any) -> Dict[str, Any]:
+def collate_tri(
+    batch: List[Dict[str, Any]],
+    processor: Any,
+    tokenizer: Optional[Any] = None,
+    max_length: Optional[int] = None,
+) -> Dict[str, Any]:
     graphs = [b["graph_data"] for b in batch]
     batch_graph = GeoBatch.from_data_list(graphs)
 
@@ -399,7 +404,7 @@ def collate_tri(batch: List[Dict[str, Any]], processor: Any) -> Dict[str, Any]:
     image_ids = [b["image_id"] for b in batch]
     qa_types = [str(b.get("qa_type", "unknown")) for b in batch]
 
-    return {
+    out = {
         "ids": ids,
         "image_ids": image_ids,
         "graph_data": batch_graph,
@@ -408,6 +413,18 @@ def collate_tri(batch: List[Dict[str, Any]], processor: Any) -> Dict[str, Any]:
         "answers": answers,
         "qa_type": qa_types,
     }
+    if tokenizer is not None and max_length is not None and int(max_length) > 0:
+        input_ids, attention_mask, labels = build_chat_inputs_and_labels(
+            tokenizer=tokenizer,
+            prompts=prompts,
+            answers=answers,
+            device=None,
+            max_length=int(max_length),
+        )
+        out["input_ids"] = input_ids
+        out["attention_mask"] = attention_mask
+        out["labels"] = labels
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +549,7 @@ class Stage3PL(pl.LightningModule):
         max_vision_tokens: int | None = None,
         llm_dtype: str = "bfloat16",
         llm_attn_implementation: str = "sdpa",
+        enable_llm_gradient_checkpointing: bool = True,
         graph_tokenizer_type: str = "qformer",
         perceiver_num_latents: int = 32,
         perceiver_num_layers: int = 3,
@@ -554,6 +572,16 @@ class Stage3PL(pl.LightningModule):
         xgv_weight: float = 0.03,
         xtc_logit_scale_init: float = 2.66,
         xtm_dup_thresh: float = 0.98,
+        enable_stage3_curriculum: bool = True,
+        curriculum_phase_a_steps: int = 2000,
+        curriculum_phase_b_steps: int = 12000,
+        phase_a_align_scale: float = 1.35,
+        phase_c_align_scale: float = 0.60,
+        phase_a_aux_scale: float = 0.80,
+        phase_c_aux_scale: float = 1.00,
+        train_graph_drop_prob: float = 0.08,
+        train_vision_drop_prob: float = 0.08,
+        enable_qa_type_modality_gate: bool = True,
         auto_resize_token_embeddings: bool = True,
     ):
         super().__init__()
@@ -594,6 +622,16 @@ class Stage3PL(pl.LightningModule):
         self.xtm_weight = max(0.0, float(xtm_weight))
         self.xgv_weight = max(0.0, float(xgv_weight))
         self.xtm_dup_thresh = float(xtm_dup_thresh)
+        self.enable_stage3_curriculum = bool(enable_stage3_curriculum)
+        self.curriculum_phase_a_steps = max(0, int(curriculum_phase_a_steps))
+        self.curriculum_phase_b_steps = max(self.curriculum_phase_a_steps + 1, int(curriculum_phase_b_steps))
+        self.phase_a_align_scale = max(0.0, float(phase_a_align_scale))
+        self.phase_c_align_scale = max(0.0, float(phase_c_align_scale))
+        self.phase_a_aux_scale = max(0.0, float(phase_a_aux_scale))
+        self.phase_c_aux_scale = max(0.0, float(phase_c_aux_scale))
+        self.train_graph_drop_prob = min(0.95, max(0.0, float(train_graph_drop_prob)))
+        self.train_vision_drop_prob = min(0.95, max(0.0, float(train_vision_drop_prob)))
+        self.enable_qa_type_modality_gate = bool(enable_qa_type_modality_gate)
         self.xtc_logit_scale = nn.Parameter(torch.tensor(float(xtc_logit_scale_init), dtype=torch.float32))
         self.xtc_logit_scale.requires_grad = bool(self.enable_xtc)
         self.alignment_config = {
@@ -606,7 +644,20 @@ class Stage3PL(pl.LightningModule):
             "xtc_logit_scale_init": float(xtc_logit_scale_init),
             "xtm_dup_thresh": float(self.xtm_dup_thresh),
         }
+        self.stage3_design_config = {
+            "enable_stage3_curriculum": bool(self.enable_stage3_curriculum),
+            "curriculum_phase_a_steps": int(self.curriculum_phase_a_steps),
+            "curriculum_phase_b_steps": int(self.curriculum_phase_b_steps),
+            "phase_a_align_scale": float(self.phase_a_align_scale),
+            "phase_c_align_scale": float(self.phase_c_align_scale),
+            "phase_a_aux_scale": float(self.phase_a_aux_scale),
+            "phase_c_aux_scale": float(self.phase_c_aux_scale),
+            "train_graph_drop_prob": float(self.train_graph_drop_prob),
+            "train_vision_drop_prob": float(self.train_vision_drop_prob),
+            "enable_qa_type_modality_gate": bool(self.enable_qa_type_modality_gate),
+        }
         self._xtm_stats_accum: Dict[str, float] = init_xtm_stats_accum()
+        self.enable_llm_gradient_checkpointing = bool(enable_llm_gradient_checkpointing)
 
         # strict pipeline: Stage3 always initializes from Stage2B ckpt
         self.stage2B_provenance = load_stage2b_weights_only_into_model(
@@ -630,11 +681,30 @@ class Stage3PL(pl.LightningModule):
             f"train_node_encoder={self.train_node_encoder}"
         )
 
-        # LLM memory-saving knobs
-        if hasattr(self.model.llm.model, "gradient_checkpointing_enable"):
-            self.model.llm.model.gradient_checkpointing_enable()
+        # LLM memory-saving / speed trade-off
+        if self.enable_llm_gradient_checkpointing:
+            if hasattr(self.model.llm.model, "gradient_checkpointing_enable"):
+                self.model.llm.model.gradient_checkpointing_enable()
+        else:
+            if hasattr(self.model.llm.model, "gradient_checkpointing_disable"):
+                self.model.llm.model.gradient_checkpointing_disable()
         if hasattr(self.model.llm.model, "config"):
             self.model.llm.model.config.use_cache = False
+        print(f"[Stage3] llm_gradient_checkpointing={self.enable_llm_gradient_checkpointing}")
+        print(
+            "[Stage3] curriculum="
+            f"{self.enable_stage3_curriculum} "
+            f"phaseA<{self.curriculum_phase_a_steps} "
+            f"phaseB<{self.curriculum_phase_b_steps} "
+            f"align_scale(A/C)={self.phase_a_align_scale}/{self.phase_c_align_scale} "
+            f"aux_scale(A/C)={self.phase_a_aux_scale}/{self.phase_c_aux_scale}"
+        )
+        print(
+            "[Stage3] modality_regularization="
+            f"drop_graph={self.train_graph_drop_prob} "
+            f"drop_vision={self.train_vision_drop_prob} "
+            f"qa_type_gate={self.enable_qa_type_modality_gate}"
+        )
 
         self.tokenizer = AutoTokenizer.from_pretrained(llm_model_name, use_fast=True)
         if self.tokenizer.pad_token is None:
@@ -648,6 +718,76 @@ class Stage3PL(pl.LightningModule):
             except Exception:
                 pass
 
+    def _resolve_curriculum_phase(self, step: int) -> Tuple[str, int]:
+        if not self.enable_stage3_curriculum:
+            return "single", 0
+        if int(step) < int(self.curriculum_phase_a_steps):
+            return "align_bootstrap", 0
+        if int(step) < int(self.curriculum_phase_b_steps):
+            return "balanced", 1
+        return "generation_focus", 2
+
+    def _resolve_effective_weights(self, phase_name: str) -> Tuple[float, float, float, float]:
+        aux_mult = 1.0
+        align_mult = 1.0
+        if phase_name == "align_bootstrap":
+            aux_mult = float(self.phase_a_aux_scale)
+            align_mult = float(self.phase_a_align_scale)
+        elif phase_name == "generation_focus":
+            aux_mult = float(self.phase_c_aux_scale)
+            align_mult = float(self.phase_c_align_scale)
+        return (
+            float(self.graph_aux_loss_weight) * aux_mult,
+            float(self.xtc_weight) * align_mult,
+            float(self.xtm_weight) * align_mult,
+            float(self.xgv_weight) * align_mult,
+        )
+
+    @staticmethod
+    def _is_like_type(qt: str, key: str) -> bool:
+        t = str(qt).strip().lower()
+        return t == key or t.startswith(f"{key}_") or f"_{key}" in t or key in t
+
+    def _build_modality_gate_scales(
+        self,
+        qa_types: List[str],
+        *,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        graph_scales: List[float] = []
+        vision_scales: List[float] = []
+        for qt in qa_types:
+            q = str(qt).strip().lower()
+            if self._is_like_type(q, "query"):
+                g, v = 1.20, 0.80
+            elif self._is_like_type(q, "logical") or self._is_like_type(q, "compare"):
+                g, v = 1.12, 0.88
+            elif self._is_like_type(q, "verify"):
+                g, v = 0.95, 1.05
+            elif self._is_like_type(q, "region") or self._is_like_type(q, "caption"):
+                g, v = 0.90, 1.10
+            else:
+                g, v = 1.00, 1.00
+            graph_scales.append(g)
+            vision_scales.append(v)
+        return (
+            torch.tensor(graph_scales, device=device, dtype=torch.float32),
+            torch.tensor(vision_scales, device=device, dtype=torch.float32),
+        )
+
+    def _sample_modality_dropout(self, *, is_train: bool) -> Tuple[bool, bool]:
+        if not is_train:
+            return False, False
+        drop_g = bool(torch.rand((), device=self.device).item() < float(self.train_graph_drop_prob))
+        drop_v = bool(torch.rand((), device=self.device).item() < float(self.train_vision_drop_prob))
+        if drop_g and drop_v:
+            # Keep at least one modality to avoid all-context collapse.
+            if bool(torch.rand((), device=self.device).item() < 0.5):
+                drop_g = False
+            else:
+                drop_v = False
+        return drop_g, drop_v
+
     def configure_optimizers(self):
         params = [p for p in self.model.parameters() if p.requires_grad]
         if self.xtc_logit_scale.requires_grad:
@@ -660,36 +800,59 @@ class Stage3PL(pl.LightningModule):
     def get_xtm_stats_summary(self) -> Dict[str, float]:
         return summarize_xtm_stats_accum(self._xtm_stats_accum)
 
-    def _step(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    def _step(self, batch: Dict[str, Any], *, is_train: bool) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         graph_data = batch["graph_data"].to(self.device)
         pixel_values = batch["pixel_values"].to(self.device)
         image_ids: List[int] = [int(x) for x in batch.get("image_ids", [])]
         prompts = batch["prompts"]
         answers = batch["answers"]
         qa_types = batch.get("qa_type", ["unknown"] * len(prompts))
+        phase_name, phase_id = self._resolve_curriculum_phase(int(self.global_step))
+        eff_aux_w, eff_xtc_w, eff_xtm_w, eff_xgv_w = self._resolve_effective_weights(phase_name)
 
-        input_ids, attention_mask, labels = build_chat_inputs_and_labels(
-            tokenizer=self.tokenizer,
-            prompts=prompts,
-            answers=answers,
-            device=self.device,
-            max_length=self.max_length,
-        )
+        if "input_ids" in batch and "attention_mask" in batch and "labels" in batch:
+            input_ids = batch["input_ids"].to(self.device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
+            labels = batch["labels"].to(self.device, non_blocking=True)
+        else:
+            input_ids, attention_mask, labels = build_chat_inputs_and_labels(
+                tokenizer=self.tokenizer,
+                prompts=prompts,
+                answers=answers,
+                device=self.device,
+                max_length=self.max_length,
+            )
         aux_binary_labels, aux_binary_mask = build_binary_aux_targets(
             qa_types=qa_types,
             answers=answers,
             device=self.device,
         )
 
+        drop_graph, drop_vision = self._sample_modality_dropout(is_train=is_train)
+        graph_input = None if drop_graph else graph_data
+        vision_input = None if drop_vision else pixel_values
+
+        graph_gate_scale = None
+        vision_gate_scale = None
+        if self.enable_qa_type_modality_gate:
+            g_scale, v_scale = self._build_modality_gate_scales(
+                qa_types=[str(x) for x in qa_types],
+                device=self.device,
+            )
+            graph_gate_scale = None if graph_input is None else g_scale
+            vision_gate_scale = None if vision_input is None else v_scale
+
         outputs = self.model(
-            graph_data=graph_data,
-            pixel_values=pixel_values,
+            graph_data=graph_input,
+            pixel_values=vision_input,
+            graph_context_scale=graph_gate_scale,
+            vision_context_scale=vision_gate_scale,
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
             aux_binary_labels=aux_binary_labels,
             aux_binary_mask=aux_binary_mask,
-            aux_loss_weight=float(self.graph_aux_loss_weight),
+            aux_loss_weight=float(eff_aux_w),
             return_alignment_features=bool(self.enable_xtc or self.enable_xtm or self.enable_xgv),
             return_debug=False,
         )
@@ -708,14 +871,24 @@ class Stage3PL(pl.LightningModule):
             enable_xtc=bool(self.enable_xtc),
             enable_xtm=bool(self.enable_xtm),
             enable_xgv=bool(self.enable_xgv),
-            xtc_weight=float(self.xtc_weight),
-            xtm_weight=float(self.xtm_weight),
-            xgv_weight=float(self.xgv_weight),
+            xtc_weight=float(eff_xtc_w),
+            xtm_weight=float(eff_xtm_w),
+            xgv_weight=float(eff_xgv_w),
             xtm_dup_thresh=float(self.xtm_dup_thresh),
             xtc_logit_scale=self.xtc_logit_scale,
             update_xtm_stats=self._update_xtm_stats,
         )
         total_loss = base_loss + weighted_align_loss
+        graph_gate_mean = (
+            graph_gate_scale.mean().detach()
+            if isinstance(graph_gate_scale, torch.Tensor) and graph_gate_scale.numel() > 0
+            else torch.tensor(0.0, device=self.device)
+        )
+        vision_gate_mean = (
+            vision_gate_scale.mean().detach()
+            if isinstance(vision_gate_scale, torch.Tensor) and vision_gate_scale.numel() > 0
+            else torch.tensor(0.0, device=self.device)
+        )
         metrics = {
             "loss_lm": lm_loss.detach(),
             "loss_aux": aux_loss.detach(),
@@ -724,11 +897,20 @@ class Stage3PL(pl.LightningModule):
             "loss_xgv": align_metrics["loss_xgv"],
             "xtm_acc": align_metrics["xtm_acc"],
             "xtm_valid_neg_ratio": align_metrics["xtm_valid_neg_ratio"],
+            "curr_phase_id": torch.tensor(float(phase_id), device=self.device),
+            "curr_eff_aux_w": torch.tensor(float(eff_aux_w), device=self.device),
+            "curr_eff_xtc_w": torch.tensor(float(eff_xtc_w), device=self.device),
+            "curr_eff_xtm_w": torch.tensor(float(eff_xtm_w), device=self.device),
+            "curr_eff_xgv_w": torch.tensor(float(eff_xgv_w), device=self.device),
+            "drop_graph": torch.tensor(1.0 if drop_graph else 0.0, device=self.device),
+            "drop_vision": torch.tensor(1.0 if drop_vision else 0.0, device=self.device),
+            "graph_gate_mean": graph_gate_mean,
+            "vision_gate_mean": vision_gate_mean,
         }
         return total_loss, metrics
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
-        loss, metrics = self._step(batch)
+        loss, metrics = self._step(batch, is_train=True)
         bsz = len(batch["prompts"])
         log_alignment_step_metrics(
             self,
@@ -738,10 +920,19 @@ class Stage3PL(pl.LightningModule):
             batch_size=bsz,
             include_xgv=True,
         )
+        self.log("train_curr_phase_id", metrics["curr_phase_id"], on_step=True, on_epoch=False, prog_bar=False, batch_size=bsz)
+        self.log("train_curr_eff_aux_w", metrics["curr_eff_aux_w"], on_step=True, on_epoch=False, prog_bar=False, batch_size=bsz)
+        self.log("train_curr_eff_xtc_w", metrics["curr_eff_xtc_w"], on_step=True, on_epoch=False, prog_bar=False, batch_size=bsz)
+        self.log("train_curr_eff_xtm_w", metrics["curr_eff_xtm_w"], on_step=True, on_epoch=False, prog_bar=False, batch_size=bsz)
+        self.log("train_curr_eff_xgv_w", metrics["curr_eff_xgv_w"], on_step=True, on_epoch=False, prog_bar=False, batch_size=bsz)
+        self.log("train_drop_graph", metrics["drop_graph"], on_step=True, on_epoch=True, prog_bar=False, batch_size=bsz)
+        self.log("train_drop_vision", metrics["drop_vision"], on_step=True, on_epoch=True, prog_bar=False, batch_size=bsz)
+        self.log("train_graph_gate_mean", metrics["graph_gate_mean"], on_step=True, on_epoch=True, prog_bar=False, batch_size=bsz)
+        self.log("train_vision_gate_mean", metrics["vision_gate_mean"], on_step=True, on_epoch=True, prog_bar=False, batch_size=bsz)
         return loss
 
     def validation_step(self, batch: Dict[str, Any], batch_idx: int):
-        loss, metrics = self._step(batch)
+        loss, metrics = self._step(batch, is_train=False)
         bsz = len(batch["prompts"])
         log_alignment_step_metrics(
             self,
@@ -751,6 +942,9 @@ class Stage3PL(pl.LightningModule):
             batch_size=bsz,
             include_xgv=True,
         )
+        self.log("val_curr_phase_id", metrics["curr_phase_id"], on_step=False, on_epoch=True, prog_bar=False, batch_size=bsz)
+        self.log("val_graph_gate_mean", metrics["graph_gate_mean"], on_step=False, on_epoch=True, prog_bar=False, batch_size=bsz)
+        self.log("val_vision_gate_mean", metrics["vision_gate_mean"], on_step=False, on_epoch=True, prog_bar=False, batch_size=bsz)
         return loss
 
 
@@ -838,6 +1032,7 @@ def main():
     ap.add_argument("--max_vision_tokens", type=int, default=0, help="If >0, truncate vision prefix tokens before LLM.")
     ap.add_argument("--llm_dtype", type=str, default="bfloat16", help="LLM load dtype: bfloat16/float16/float32.")
     ap.add_argument("--llm_attn_implementation", type=str, default="sdpa", help="LLM attention backend (e.g., sdpa/flash_attention_2).")
+    ap.add_argument("--enable_llm_gradient_checkpointing", type=int, default=1, choices=[0, 1], help="Enable LLM gradient checkpointing.")
     ap.add_argument("--graph_tokenizer_type", type=str, default="auto", choices=["auto", "qformer", "perceiver"])
     ap.add_argument("--perceiver_num_latents", type=int, default=-1, help="<=0 means inherit from GraphRefine provenance.")
     ap.add_argument("--perceiver_num_layers", type=int, default=-1, help="<=0 means inherit from GraphRefine provenance.")
@@ -859,6 +1054,16 @@ def main():
     ap.add_argument("--xtm_weight", type=float, default=0.03, help="Weight for XTM loss.")
     ap.add_argument("--xtc_logit_scale_init", type=float, default=2.66, help="Initial logit scale parameter (log space).")
     ap.add_argument("--xtm_dup_thresh", type=float, default=0.98, help="Cosine similarity threshold for duplicate-text negative filtering.")
+    ap.add_argument("--enable_stage3_curriculum", type=int, default=1, choices=[0, 1], help="Enable phase-wise loss curriculum in Stage3.")
+    ap.add_argument("--curriculum_phase_a_steps", type=int, default=2000, help="Phase-A (alignment bootstrap) end step.")
+    ap.add_argument("--curriculum_phase_b_steps", type=int, default=12000, help="Phase-B (balanced) end step; then enters phase-C.")
+    ap.add_argument("--phase_a_align_scale", type=float, default=1.35, help="Alignment loss multiplier during phase-A.")
+    ap.add_argument("--phase_c_align_scale", type=float, default=0.60, help="Alignment loss multiplier during phase-C.")
+    ap.add_argument("--phase_a_aux_scale", type=float, default=0.80, help="Auxiliary loss multiplier during phase-A.")
+    ap.add_argument("--phase_c_aux_scale", type=float, default=1.00, help="Auxiliary loss multiplier during phase-C.")
+    ap.add_argument("--train_graph_drop_prob", type=float, default=0.08, help="Train-time probability to drop graph modality for robustness.")
+    ap.add_argument("--train_vision_drop_prob", type=float, default=0.08, help="Train-time probability to drop vision modality for robustness.")
+    ap.add_argument("--enable_qa_type_modality_gate", type=int, default=1, choices=[0, 1], help="Use qa_type-conditioned graph/vision scaling.")
 
     ap.add_argument("--lr", type=float, default=5e-5)
     ap.add_argument("--max_steps", type=int, default=20000)
@@ -874,6 +1079,7 @@ def main():
     ap.add_argument("--limit_val_batches", type=float, default=1.0)
     ap.add_argument("--num_sanity_val_steps", type=int, default=0)
     ap.add_argument("--accumulate_grad_batches", type=int, default=4)
+    ap.add_argument("--prefetch_factor", type=int, default=4, help="DataLoader prefetch_factor when num_workers > 0.")
 
     ap.add_argument("--save_dir", type=str, default="checkpoints_multimodal_tune")
     ap.add_argument("--resume_from_checkpoint", type=str, default="", help="Resume full trainer state from this checkpoint.")
@@ -993,11 +1199,23 @@ def main():
     train_ds, val_ds = split_by_image_id(full_dataset, val_ratio=float(args.val_ratio), seed=int(args.seed))
     print(f"[Split] train={len(train_ds)} val={len(val_ds)} (val_ratio={args.val_ratio})")
 
-    # 5) vision processor (to pixel_values)
+    # 5) processors/tokenizer for collate-time preprocessing
     processor = AutoProcessor.from_pretrained(args.vision)
+    tokenizer_for_collate = AutoTokenizer.from_pretrained(args.llm, use_fast=True)
+    if tokenizer_for_collate.pad_token is None:
+        tokenizer_for_collate.pad_token = tokenizer_for_collate.eos_token
+    max_length_for_collate = min(
+        int(getattr(tokenizer_for_collate, "model_max_length", 2048)),
+        int(args.max_length),
+    )
 
     def _collate(batch):
-        return collate_tri(batch, processor=processor)
+        return collate_tri(
+            batch=batch,
+            processor=processor,
+            tokenizer=tokenizer_for_collate,
+            max_length=max_length_for_collate,
+        )
 
     train_loader = DataLoader(
         train_ds,
@@ -1006,6 +1224,7 @@ def main():
         num_workers=int(args.num_workers),
         pin_memory=True,
         persistent_workers=(int(args.num_workers) > 0),
+        prefetch_factor=(int(args.prefetch_factor) if int(args.num_workers) > 0 else None),
         collate_fn=_collate,
     )
     val_loader = DataLoader(
@@ -1015,6 +1234,7 @@ def main():
         num_workers=int(args.num_workers),
         pin_memory=True,
         persistent_workers=(int(args.num_workers) > 0),
+        prefetch_factor=(int(args.prefetch_factor) if int(args.num_workers) > 0 else None),
         collate_fn=_collate,
     )
 
@@ -1034,6 +1254,7 @@ def main():
         max_vision_tokens=(int(args.max_vision_tokens) if int(args.max_vision_tokens) > 0 else None),
         llm_dtype=str(args.llm_dtype),
         llm_attn_implementation=str(args.llm_attn_implementation),
+        enable_llm_gradient_checkpointing=bool(int(args.enable_llm_gradient_checkpointing)),
         graph_tokenizer_type=str(resolved_graph_tokenizer_config.get("type")),
         perceiver_num_latents=int(resolved_graph_tokenizer_config.get("num_latents", 32)),
         perceiver_num_layers=int(resolved_graph_tokenizer_config.get("num_layers", 3)),
@@ -1056,6 +1277,16 @@ def main():
         xgv_weight=float(args.xgv_weight),
         xtc_logit_scale_init=float(args.xtc_logit_scale_init),
         xtm_dup_thresh=float(args.xtm_dup_thresh),
+        enable_stage3_curriculum=bool(int(args.enable_stage3_curriculum)),
+        curriculum_phase_a_steps=int(args.curriculum_phase_a_steps),
+        curriculum_phase_b_steps=int(args.curriculum_phase_b_steps),
+        phase_a_align_scale=float(args.phase_a_align_scale),
+        phase_c_align_scale=float(args.phase_c_align_scale),
+        phase_a_aux_scale=float(args.phase_a_aux_scale),
+        phase_c_aux_scale=float(args.phase_c_aux_scale),
+        train_graph_drop_prob=float(args.train_graph_drop_prob),
+        train_vision_drop_prob=float(args.train_vision_drop_prob),
+        enable_qa_type_modality_gate=bool(int(args.enable_qa_type_modality_gate)),
         auto_resize_token_embeddings=True,
     )
 
@@ -1164,6 +1395,7 @@ def main():
         extra_fields={
             "legacy_stage": "stage3",
             "stage2B_provenance": pl_model.stage2B_provenance,
+            "stage3_design_config": pl_model.stage3_design_config,
         },
     )
     stage_meta_text = json.dumps(stage_meta, ensure_ascii=False, indent=2)

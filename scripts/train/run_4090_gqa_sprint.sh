@@ -148,6 +148,26 @@ S3_ENABLE_XGV=${S3_ENABLE_XGV:-1}
 S3_XGV_WEIGHT=${S3_XGV_WEIGHT:-0.03}
 S3_R2_ENABLE_XGV=${S3_R2_ENABLE_XGV:-$S3_ENABLE_XGV}
 S3_R2_XGV_WEIGHT=${S3_R2_XGV_WEIGHT:-$S3_XGV_WEIGHT}
+S3_ENABLE_STAGE3_CURRICULUM=${S3_ENABLE_STAGE3_CURRICULUM:-1}
+S3_CURRICULUM_PHASE_A_STEPS=${S3_CURRICULUM_PHASE_A_STEPS:-2000}
+S3_CURRICULUM_PHASE_B_STEPS=${S3_CURRICULUM_PHASE_B_STEPS:-12000}
+S3_PHASE_A_ALIGN_SCALE=${S3_PHASE_A_ALIGN_SCALE:-1.35}
+S3_PHASE_C_ALIGN_SCALE=${S3_PHASE_C_ALIGN_SCALE:-0.60}
+S3_PHASE_A_AUX_SCALE=${S3_PHASE_A_AUX_SCALE:-0.80}
+S3_PHASE_C_AUX_SCALE=${S3_PHASE_C_AUX_SCALE:-1.00}
+S3_TRAIN_GRAPH_DROP_PROB=${S3_TRAIN_GRAPH_DROP_PROB:-0.08}
+S3_TRAIN_VISION_DROP_PROB=${S3_TRAIN_VISION_DROP_PROB:-0.08}
+S3_ENABLE_QA_TYPE_MODALITY_GATE=${S3_ENABLE_QA_TYPE_MODALITY_GATE:-1}
+S3_R2_ENABLE_STAGE3_CURRICULUM=${S3_R2_ENABLE_STAGE3_CURRICULUM:-$S3_ENABLE_STAGE3_CURRICULUM}
+S3_R2_CURRICULUM_PHASE_A_STEPS=${S3_R2_CURRICULUM_PHASE_A_STEPS:-$S3_CURRICULUM_PHASE_A_STEPS}
+S3_R2_CURRICULUM_PHASE_B_STEPS=${S3_R2_CURRICULUM_PHASE_B_STEPS:-$S3_CURRICULUM_PHASE_B_STEPS}
+S3_R2_PHASE_A_ALIGN_SCALE=${S3_R2_PHASE_A_ALIGN_SCALE:-$S3_PHASE_A_ALIGN_SCALE}
+S3_R2_PHASE_C_ALIGN_SCALE=${S3_R2_PHASE_C_ALIGN_SCALE:-$S3_PHASE_C_ALIGN_SCALE}
+S3_R2_PHASE_A_AUX_SCALE=${S3_R2_PHASE_A_AUX_SCALE:-$S3_PHASE_A_AUX_SCALE}
+S3_R2_PHASE_C_AUX_SCALE=${S3_R2_PHASE_C_AUX_SCALE:-$S3_PHASE_C_AUX_SCALE}
+S3_R2_TRAIN_GRAPH_DROP_PROB=${S3_R2_TRAIN_GRAPH_DROP_PROB:-$S3_TRAIN_GRAPH_DROP_PROB}
+S3_R2_TRAIN_VISION_DROP_PROB=${S3_R2_TRAIN_VISION_DROP_PROB:-$S3_TRAIN_VISION_DROP_PROB}
+S3_R2_ENABLE_QA_TYPE_MODALITY_GATE=${S3_R2_ENABLE_QA_TYPE_MODALITY_GATE:-$S3_ENABLE_QA_TYPE_MODALITY_GATE}
 
 if [ "$LOW_VRAM_4090" = "1" ]; then
   if [ "$LLM_MODEL" = "$DEFAULT_LLM_7B" ]; then
@@ -165,6 +185,8 @@ if [ "$LOW_VRAM_4090" = "1" ]; then
 : "${S2A_LIMIT_VAL_BATCHES:=0.002}"
 : "${S2A_TRAIN_NODE_ENCODER:=1}"
 : "${S2A_CHECKPOINT_EVERY_N_STEPS:=1000}"
+: "${S2A_ENABLE_LLM_GRADIENT_CHECKPOINTING:=1}"
+: "${S2A_PREFETCH_FACTOR:=4}"
 
   : "${S2B_BATCH_SIZE:=1}"
   : "${S2B_MAX_LENGTH:=96}"
@@ -177,6 +199,8 @@ if [ "$LOW_VRAM_4090" = "1" ]; then
 : "${S2B_LIMIT_VAL_BATCHES:=0.002}"
 : "${S2B_TRAIN_NODE_ENCODER:=1}"
 : "${S2B_CHECKPOINT_EVERY_N_STEPS:=1000}"
+: "${S2B_ENABLE_LLM_GRADIENT_CHECKPOINTING:=1}"
+: "${S2B_PREFETCH_FACTOR:=4}"
 
   : "${S3_BATCH_SIZE:=1}"
   : "${S3_MAX_LENGTH:=96}"
@@ -190,6 +214,8 @@ if [ "$LOW_VRAM_4090" = "1" ]; then
 : "${S3_LIMIT_VAL_BATCHES:=0.002}"
 : "${S3_TRAIN_NODE_ENCODER:=0}"
 : "${S3_CHECKPOINT_EVERY_N_STEPS:=1000}"
+: "${S3_ENABLE_LLM_GRADIENT_CHECKPOINTING:=1}"
+: "${S3_PREFETCH_FACTOR:=4}"
 
   : "${S2B_R2_BATCH_SIZE:=1}"
   : "${S2B_R2_MAX_LENGTH:=96}"
@@ -202,6 +228,8 @@ if [ "$LOW_VRAM_4090" = "1" ]; then
 : "${S2B_R2_LIMIT_VAL_BATCHES:=0.002}"
 : "${S2B_R2_TRAIN_NODE_ENCODER:=1}"
 : "${S2B_R2_CHECKPOINT_EVERY_N_STEPS:=1000}"
+: "${S2B_R2_ENABLE_LLM_GRADIENT_CHECKPOINTING:=1}"
+: "${S2B_R2_PREFETCH_FACTOR:=4}"
 
   : "${S3_R2_BATCH_SIZE:=1}"
   : "${S3_R2_MAX_LENGTH:=96}"
@@ -215,6 +243,8 @@ if [ "$LOW_VRAM_4090" = "1" ]; then
 : "${S3_R2_LIMIT_VAL_BATCHES:=0.002}"
 : "${S3_R2_TRAIN_NODE_ENCODER:=0}"
 : "${S3_R2_CHECKPOINT_EVERY_N_STEPS:=1000}"
+: "${S3_R2_ENABLE_LLM_GRADIENT_CHECKPOINTING:=1}"
+: "${S3_R2_PREFETCH_FACTOR:=4}"
 else
   : "${S2A_BATCH_SIZE:=12}"
   : "${S2A_MAX_LENGTH:=128}"
@@ -227,6 +257,8 @@ else
 : "${S2A_LIMIT_VAL_BATCHES:=0.002}"
 : "${S2A_TRAIN_NODE_ENCODER:=1}"
 : "${S2A_CHECKPOINT_EVERY_N_STEPS:=1000}"
+: "${S2A_ENABLE_LLM_GRADIENT_CHECKPOINTING:=0}"
+: "${S2A_PREFETCH_FACTOR:=6}"
 
   : "${S2B_BATCH_SIZE:=12}"
   : "${S2B_MAX_LENGTH:=128}"
@@ -239,6 +271,8 @@ else
 : "${S2B_LIMIT_VAL_BATCHES:=0.002}"
 : "${S2B_TRAIN_NODE_ENCODER:=1}"
 : "${S2B_CHECKPOINT_EVERY_N_STEPS:=1000}"
+: "${S2B_ENABLE_LLM_GRADIENT_CHECKPOINTING:=0}"
+: "${S2B_PREFETCH_FACTOR:=6}"
 
   : "${S3_BATCH_SIZE:=6}"
   : "${S3_MAX_LENGTH:=128}"
@@ -252,6 +286,8 @@ else
 : "${S3_LIMIT_VAL_BATCHES:=0.002}"
 : "${S3_TRAIN_NODE_ENCODER:=0}"
 : "${S3_CHECKPOINT_EVERY_N_STEPS:=1000}"
+: "${S3_ENABLE_LLM_GRADIENT_CHECKPOINTING:=0}"
+: "${S3_PREFETCH_FACTOR:=6}"
 
   : "${S2B_R2_BATCH_SIZE:=12}"
   : "${S2B_R2_MAX_LENGTH:=128}"
@@ -264,6 +300,8 @@ else
 : "${S2B_R2_LIMIT_VAL_BATCHES:=0.002}"
 : "${S2B_R2_TRAIN_NODE_ENCODER:=1}"
 : "${S2B_R2_CHECKPOINT_EVERY_N_STEPS:=1000}"
+: "${S2B_R2_ENABLE_LLM_GRADIENT_CHECKPOINTING:=0}"
+: "${S2B_R2_PREFETCH_FACTOR:=6}"
 
   : "${S3_R2_BATCH_SIZE:=6}"
   : "${S3_R2_MAX_LENGTH:=128}"
@@ -277,6 +315,8 @@ else
 : "${S3_R2_LIMIT_VAL_BATCHES:=0.002}"
 : "${S3_R2_TRAIN_NODE_ENCODER:=0}"
 : "${S3_R2_CHECKPOINT_EVERY_N_STEPS:=1000}"
+: "${S3_R2_ENABLE_LLM_GRADIENT_CHECKPOINTING:=0}"
+: "${S3_R2_PREFETCH_FACTOR:=6}"
 fi
 
 : "${S2A_GRAPH_QA_MAX_PER_IMAGE:=5}"
@@ -724,12 +764,16 @@ echo "[Config] AUX_W: S2A=${S2A_GRAPH_AUX_LOSS_WEIGHT} S2B=${S2B_GRAPH_AUX_LOSS_
 echo "[Config] ALIGN: ENABLE_XTC=${ENABLE_XTC} ENABLE_XTM=${ENABLE_XTM} SCALE_INIT=${XTC_LOGIT_SCALE_INIT} DUP_THRESH=${XTM_DUP_THRESH}"
 echo "[Config] XTC/XTM W: S2A=${S2A_XTC_WEIGHT}/${S2A_XTM_WEIGHT} S2B=${S2B_XTC_WEIGHT}/${S2B_XTM_WEIGHT} S3=${S3_XTC_WEIGHT}/${S3_XTM_WEIGHT} S2B_R2=${S2B_R2_XTC_WEIGHT}/${S2B_R2_XTM_WEIGHT} S3_R2=${S3_R2_XTC_WEIGHT}/${S3_R2_XTM_WEIGHT}"
 echo "[Config] XGV: S3(enable=${S3_ENABLE_XGV},weight=${S3_XGV_WEIGHT}) S3_R2(enable=${S3_R2_ENABLE_XGV},weight=${S3_R2_XGV_WEIGHT})"
+echo "[Config] Stage3V2: curriculum=${S3_ENABLE_STAGE3_CURRICULUM} A<${S3_CURRICULUM_PHASE_A_STEPS} B<${S3_CURRICULUM_PHASE_B_STEPS} align(A/C)=${S3_PHASE_A_ALIGN_SCALE}/${S3_PHASE_C_ALIGN_SCALE} aux(A/C)=${S3_PHASE_A_AUX_SCALE}/${S3_PHASE_C_AUX_SCALE}"
+echo "[Config] Stage3V2: modality_drop(graph/vision)=${S3_TRAIN_GRAPH_DROP_PROB}/${S3_TRAIN_VISION_DROP_PROB} qa_type_gate=${S3_ENABLE_QA_TYPE_MODALITY_GATE}"
 echo "[Config] EXTRA_SCENE_GRAPHS=${EXTRA_SCENE_GRAPHS:-<none>}"
 echo "[Config] pseudo_qa: S2A(max=${S2A_PSEUDO_GRAPH_QA_MAX_PER_IMAGE},repeat=${S2A_PSEUDO_GRAPH_QA_REPEAT}) S2B(max=${S2B_PSEUDO_GRAPH_QA_MAX_PER_IMAGE},repeat=${S2B_PSEUDO_GRAPH_QA_REPEAT}) S3(max=${S3_PSEUDO_GRAPH_QA_MAX_PER_IMAGE},repeat=${S3_PSEUDO_GRAPH_QA_REPEAT})"
 echo "[Config] pseudo_qa_r2: S2B(max=${S2B_R2_PSEUDO_GRAPH_QA_MAX_PER_IMAGE},repeat=${S2B_R2_PSEUDO_GRAPH_QA_REPEAT}) S3(max=${S3_R2_PSEUDO_GRAPH_QA_MAX_PER_IMAGE},repeat=${S3_R2_PSEUDO_GRAPH_QA_REPEAT})"
 echo "[Config] S2A bs=${S2A_BATCH_SIZE} max_len=${S2A_MAX_LENGTH} workers=${S2A_NUM_WORKERS} prec=${S2A_PRECISION}"
 echo "[Config] S2B bs=${S2B_BATCH_SIZE} max_len=${S2B_MAX_LENGTH} workers=${S2B_NUM_WORKERS} prec=${S2B_PRECISION}"
 echo "[Config] S3  bs=${S3_BATCH_SIZE} max_len=${S3_MAX_LENGTH} workers=${S3_NUM_WORKERS} prec=${S3_PRECISION}"
+echo "[Config] llm_grad_ckpt: S2A=${S2A_ENABLE_LLM_GRADIENT_CHECKPOINTING} S2B=${S2B_ENABLE_LLM_GRADIENT_CHECKPOINTING} S3=${S3_ENABLE_LLM_GRADIENT_CHECKPOINTING} S2B_R2=${S2B_R2_ENABLE_LLM_GRADIENT_CHECKPOINTING} S3_R2=${S3_R2_ENABLE_LLM_GRADIENT_CHECKPOINTING}"
+echo "[Config] prefetch: S2A=${S2A_PREFETCH_FACTOR} S2B=${S2B_PREFETCH_FACTOR} S3=${S3_PREFETCH_FACTOR} S2B_R2=${S2B_R2_PREFETCH_FACTOR} S3_R2=${S3_R2_PREFETCH_FACTOR}"
 echo "[Config] manual_stop: S2A=${S2A_MANUAL_STOP_FILE} S2B=${S2B_MANUAL_STOP_FILE} S3=${S3_MANUAL_STOP_FILE}"
 echo "[Config] step_ckpt: S2A=${S2A_CHECKPOINT_EVERY_N_STEPS} S2B=${S2B_CHECKPOINT_EVERY_N_STEPS} S3=${S3_CHECKPOINT_EVERY_N_STEPS} S2B_R2=${S2B_R2_CHECKPOINT_EVERY_N_STEPS} S3_R2=${S3_R2_CHECKPOINT_EVERY_N_STEPS}"
 echo "[Config] val: S2A(interval=${S2A_VAL_CHECK_INTERVAL},limit=${S2A_LIMIT_VAL_BATCHES}) S2B(interval=${S2B_VAL_CHECK_INTERVAL},limit=${S2B_LIMIT_VAL_BATCHES}) S3(interval=${S3_VAL_CHECK_INTERVAL},limit=${S3_LIMIT_VAL_BATCHES})"
@@ -777,6 +821,7 @@ if [ "$RUN_STAGE2A" = "1" ]; then
     --llm "$LLM_MODEL" \
     --llm_dtype "$LLM_DTYPE" \
     --llm_attn_implementation "$LLM_ATTN_IMPL" \
+    --enable_llm_gradient_checkpointing "$S2A_ENABLE_LLM_GRADIENT_CHECKPOINTING" \
     --graph_tokenizer_type "$GRAPH_TOKENIZER_TYPE" \
     --perceiver_num_latents "$PERCEIVER_NUM_LATENTS" \
     --perceiver_num_layers "$PERCEIVER_NUM_LAYERS" \
@@ -807,6 +852,7 @@ if [ "$RUN_STAGE2A" = "1" ]; then
     --max_length "$S2A_MAX_LENGTH" \
     --max_graph_tokens "$S2A_MAX_GRAPH_TOKENS" \
     --num_workers "$S2A_NUM_WORKERS" \
+    --prefetch_factor "$S2A_PREFETCH_FACTOR" \
     --num_sanity_val_steps "$S2A_NUM_SANITY_VAL_STEPS" \
     --accumulate_grad_batches "$S2A_ACCUM_GRAD_BATCHES" \
     --val_ratio "$S2A_VAL_RATIO" \
@@ -838,6 +884,7 @@ if [ "$RUN_STAGE2B" = "1" ]; then
     --llm "$LLM_MODEL" \
     --llm_dtype "$LLM_DTYPE" \
     --llm_attn_implementation "$LLM_ATTN_IMPL" \
+    --enable_llm_gradient_checkpointing "$S2B_ENABLE_LLM_GRADIENT_CHECKPOINTING" \
     --graph_tokenizer_type "$GRAPH_TOKENIZER_TYPE" \
     --perceiver_num_latents "$PERCEIVER_NUM_LATENTS" \
     --perceiver_num_layers "$PERCEIVER_NUM_LAYERS" \
@@ -868,6 +915,7 @@ if [ "$RUN_STAGE2B" = "1" ]; then
     --max_length "$S2B_MAX_LENGTH" \
     --max_graph_tokens "$S2B_MAX_GRAPH_TOKENS" \
     --num_workers "$S2B_NUM_WORKERS" \
+    --prefetch_factor "$S2B_PREFETCH_FACTOR" \
     --num_sanity_val_steps "$S2B_NUM_SANITY_VAL_STEPS" \
     --accumulate_grad_batches "$S2B_ACCUM_GRAD_BATCHES" \
     --lr "$S2B_LR" \
@@ -897,6 +945,7 @@ if [ "$RUN_STAGE3" = "1" ]; then
     --llm "$LLM_MODEL" \
     --llm_dtype "$LLM_DTYPE" \
     --llm_attn_implementation "$LLM_ATTN_IMPL" \
+    --enable_llm_gradient_checkpointing "$S3_ENABLE_LLM_GRADIENT_CHECKPOINTING" \
     --graph_tokenizer_type "$GRAPH_TOKENIZER_TYPE" \
     --perceiver_num_latents "$PERCEIVER_NUM_LATENTS" \
     --perceiver_num_layers "$PERCEIVER_NUM_LAYERS" \
@@ -919,6 +968,16 @@ if [ "$RUN_STAGE3" = "1" ]; then
     --xtm_dup_thresh "$XTM_DUP_THRESH" \
     --enable_xgv "$S3_ENABLE_XGV" \
     --xgv_weight "$S3_XGV_WEIGHT" \
+    --enable_stage3_curriculum "$S3_ENABLE_STAGE3_CURRICULUM" \
+    --curriculum_phase_a_steps "$S3_CURRICULUM_PHASE_A_STEPS" \
+    --curriculum_phase_b_steps "$S3_CURRICULUM_PHASE_B_STEPS" \
+    --phase_a_align_scale "$S3_PHASE_A_ALIGN_SCALE" \
+    --phase_c_align_scale "$S3_PHASE_C_ALIGN_SCALE" \
+    --phase_a_aux_scale "$S3_PHASE_A_AUX_SCALE" \
+    --phase_c_aux_scale "$S3_PHASE_C_AUX_SCALE" \
+    --train_graph_drop_prob "$S3_TRAIN_GRAPH_DROP_PROB" \
+    --train_vision_drop_prob "$S3_TRAIN_VISION_DROP_PROB" \
+    --enable_qa_type_modality_gate "$S3_ENABLE_QA_TYPE_MODALITY_GATE" \
     --train_node_encoder "$S3_TRAIN_NODE_ENCODER" \
     --vision "$VISION_MODEL" \
     --graph_qa_max_per_image "$S3_GRAPH_QA_MAX_PER_IMAGE" \
@@ -931,6 +990,7 @@ if [ "$RUN_STAGE3" = "1" ]; then
     --max_graph_tokens "$S3_MAX_GRAPH_TOKENS" \
     --max_vision_tokens "$S3_MAX_VISION_TOKENS" \
     --num_workers "$S3_NUM_WORKERS" \
+    --prefetch_factor "$S3_PREFETCH_FACTOR" \
     --num_sanity_val_steps "$S3_NUM_SANITY_VAL_STEPS" \
     --accumulate_grad_batches "$S3_ACCUM_GRAD_BATCHES" \
     --lr "$S3_LR" \
@@ -1100,6 +1160,7 @@ S2B_R2_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_graph_refine.py" \
   --llm "$LLM_MODEL" \
   --llm_dtype "$LLM_DTYPE" \
   --llm_attn_implementation "$LLM_ATTN_IMPL" \
+  --enable_llm_gradient_checkpointing "$S2B_R2_ENABLE_LLM_GRADIENT_CHECKPOINTING" \
   --graph_tokenizer_type "$GRAPH_TOKENIZER_TYPE" \
   --perceiver_num_latents "$PERCEIVER_NUM_LATENTS" \
   --perceiver_num_layers "$PERCEIVER_NUM_LAYERS" \
@@ -1130,6 +1191,7 @@ S2B_R2_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_graph_refine.py" \
   --max_length "$S2B_R2_MAX_LENGTH" \
   --max_graph_tokens "$S2B_R2_MAX_GRAPH_TOKENS" \
   --num_workers "$S2B_R2_NUM_WORKERS" \
+  --prefetch_factor "$S2B_R2_PREFETCH_FACTOR" \
   --num_sanity_val_steps "$S2B_R2_NUM_SANITY_VAL_STEPS" \
   --accumulate_grad_batches "$S2B_R2_ACCUM_GRAD_BATCHES" \
   --lr "$S2B_R2_LR" \
@@ -1163,6 +1225,7 @@ S3_R2_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_multimodal_tune.py" \
   --llm "$LLM_MODEL" \
   --llm_dtype "$LLM_DTYPE" \
   --llm_attn_implementation "$LLM_ATTN_IMPL" \
+  --enable_llm_gradient_checkpointing "$S3_R2_ENABLE_LLM_GRADIENT_CHECKPOINTING" \
   --graph_tokenizer_type "$GRAPH_TOKENIZER_TYPE" \
   --perceiver_num_latents "$PERCEIVER_NUM_LATENTS" \
   --perceiver_num_layers "$PERCEIVER_NUM_LAYERS" \
@@ -1185,6 +1248,16 @@ S3_R2_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_multimodal_tune.py" \
   --xtm_dup_thresh "$XTM_DUP_THRESH" \
   --enable_xgv "$S3_R2_ENABLE_XGV" \
   --xgv_weight "$S3_R2_XGV_WEIGHT" \
+  --enable_stage3_curriculum "$S3_R2_ENABLE_STAGE3_CURRICULUM" \
+  --curriculum_phase_a_steps "$S3_R2_CURRICULUM_PHASE_A_STEPS" \
+  --curriculum_phase_b_steps "$S3_R2_CURRICULUM_PHASE_B_STEPS" \
+  --phase_a_align_scale "$S3_R2_PHASE_A_ALIGN_SCALE" \
+  --phase_c_align_scale "$S3_R2_PHASE_C_ALIGN_SCALE" \
+  --phase_a_aux_scale "$S3_R2_PHASE_A_AUX_SCALE" \
+  --phase_c_aux_scale "$S3_R2_PHASE_C_AUX_SCALE" \
+  --train_graph_drop_prob "$S3_R2_TRAIN_GRAPH_DROP_PROB" \
+  --train_vision_drop_prob "$S3_R2_TRAIN_VISION_DROP_PROB" \
+  --enable_qa_type_modality_gate "$S3_R2_ENABLE_QA_TYPE_MODALITY_GATE" \
   --train_node_encoder "$S3_R2_TRAIN_NODE_ENCODER" \
   --vision "$VISION_MODEL" \
   --graph_qa_max_per_image "$S3_R2_GRAPH_QA_MAX_PER_IMAGE" \
@@ -1197,6 +1270,7 @@ S3_R2_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_multimodal_tune.py" \
   --max_graph_tokens "$S3_R2_MAX_GRAPH_TOKENS" \
   --max_vision_tokens "$S3_R2_MAX_VISION_TOKENS" \
   --num_workers "$S3_R2_NUM_WORKERS" \
+  --prefetch_factor "$S3_R2_PREFETCH_FACTOR" \
   --num_sanity_val_steps "$S3_R2_NUM_SANITY_VAL_STEPS" \
   --accumulate_grad_batches "$S3_R2_ACCUM_GRAD_BATCHES" \
   --lr "$S3_R2_LR" \

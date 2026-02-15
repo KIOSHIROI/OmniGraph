@@ -359,6 +359,47 @@ class OmniGraphModel(nn.Module):
         except Exception:
             pass
 
+    @staticmethod
+    def _resolve_context_scale(
+        scale: torch.Tensor | float | int | None,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        if scale is None:
+            return None
+        if isinstance(scale, torch.Tensor):
+            s = scale.to(device=device, dtype=dtype).view(-1)
+        else:
+            s = torch.tensor([float(scale)], device=device, dtype=dtype).view(-1)
+        if s.numel() == 1:
+            s = s.expand(int(batch_size))
+        elif s.numel() != int(batch_size):
+            raise ValueError(
+                f"Context scale length mismatch: got {int(s.numel())}, expected {int(batch_size)}."
+            )
+        return s.clamp(min=0.0, max=2.0)
+
+    @staticmethod
+    def _apply_context_scale(
+        embeds: torch.Tensor | None,
+        scale: torch.Tensor | float | int | None,
+        *,
+        batch_size: int,
+    ) -> torch.Tensor | None:
+        if embeds is None:
+            return None
+        s = OmniGraphModel._resolve_context_scale(
+            scale=scale,
+            batch_size=batch_size,
+            device=embeds.device,
+            dtype=embeds.dtype,
+        )
+        if s is None:
+            return embeds
+        return embeds * s.view(-1, 1, 1)
+
     @property
     def vg_adapter(self):
         # Backward-compatible view for legacy call-sites.
@@ -389,6 +430,8 @@ class OmniGraphModel(nn.Module):
                 attention_mask=None,
                 graph_data=None, # Expecting object with input_ids, attention_mask for GraphGPT
                 pixel_values=None, # (B, 3, H, W)
+                graph_context_scale: torch.Tensor | float | None = None,
+                vision_context_scale: torch.Tensor | float | None = None,
                 labels=None,
                 aux_binary_labels: torch.Tensor | None = None,
                 aux_binary_mask: torch.Tensor | None = None,
@@ -425,6 +468,11 @@ class OmniGraphModel(nn.Module):
                 debug["graph_prefix_tokens"] = int(graph_embeds.shape[1])
             if graph_embeds.dtype != target_dtype:
                 graph_embeds = graph_embeds.to(target_dtype)
+            graph_embeds = self._apply_context_scale(
+                graph_embeds,
+                graph_context_scale,
+                batch_size=batch_size,
+            )
 
         # 2. Process Vision Data
         # Support missing modality: if pixel_values is None, skip adding tokens
@@ -443,6 +491,11 @@ class OmniGraphModel(nn.Module):
                 debug["vision_prefix_tokens"] = int(vision_embeds.shape[1])
             if vision_embeds.dtype != target_dtype:
                 vision_embeds = vision_embeds.to(target_dtype)
+            vision_embeds = self._apply_context_scale(
+                vision_embeds,
+                vision_context_scale,
+                batch_size=batch_size,
+            )
 
         context_tokens = []
         if graph_embeds is not None:
@@ -541,7 +594,15 @@ class OmniGraphModel(nn.Module):
             return outputs, debug
         return outputs
 
-    def generate(self, input_ids, graph_data=None, pixel_values=None, **kwargs):
+    def generate(
+        self,
+        input_ids,
+        graph_data=None,
+        pixel_values=None,
+        graph_context_scale: torch.Tensor | float | None = None,
+        vision_context_scale: torch.Tensor | float | None = None,
+        **kwargs,
+    ):
         # Get LLM token embeddings
         inputs_embeds = self.llm.model.get_input_embeddings()(input_ids)
         target_dtype = inputs_embeds.dtype
@@ -554,6 +615,11 @@ class OmniGraphModel(nn.Module):
             graph_embeds = self._truncate_prefix_tokens(graph_embeds, self.max_graph_tokens)
             if graph_embeds.dtype != target_dtype:
                 graph_embeds = graph_embeds.to(target_dtype)
+            graph_embeds = self._apply_context_scale(
+                graph_embeds,
+                graph_context_scale,
+                batch_size=int(inputs_embeds.shape[0]),
+            )
 
         vision_embeds = None
         if pixel_values is not None and self.vision_branch is not None and self.vl_projector is not None:
@@ -562,6 +628,11 @@ class OmniGraphModel(nn.Module):
             vision_embeds = self._truncate_prefix_tokens(vision_embeds, self.max_vision_tokens)
             if vision_embeds.dtype != target_dtype:
                 vision_embeds = vision_embeds.to(target_dtype)
+            vision_embeds = self._apply_context_scale(
+                vision_embeds,
+                vision_context_scale,
+                batch_size=int(inputs_embeds.shape[0]),
+            )
 
         context_tokens = []
         if graph_embeds is not None:

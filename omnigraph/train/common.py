@@ -91,55 +91,70 @@ def build_chat_inputs_and_labels(
     tokenizer: Any,
     prompts: Sequence[str],
     answers: Sequence[str],
-    device: torch.device,
+    device: torch.device | str | None,
     max_length: int = 256,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     use_chat = hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None
+    prompts = [str(p or "") for p in prompts]
+    answers = [str(a or "") for a in answers]
 
-    input_ids_list: List[torch.Tensor] = []
-    labels_list: List[torch.Tensor] = []
-    attn_list: List[torch.Tensor] = []
-
-    for prompt, answer in zip(prompts, answers):
-        prompt = str(prompt or "")
-        answer = str(answer or "")
-
-        if use_chat:
+    if use_chat:
+        full_texts: List[str] = []
+        prompt_texts: List[str] = []
+        for prompt, answer in zip(prompts, answers):
             messages_full = [{"role": "user", "content": prompt}, {"role": "assistant", "content": answer}]
-            full_text = tokenizer.apply_chat_template(messages_full, tokenize=False, add_generation_prompt=False)
-
             messages_prompt = [{"role": "user", "content": prompt}]
-            prompt_text = tokenizer.apply_chat_template(messages_prompt, tokenize=False, add_generation_prompt=True)
+            full_texts.append(tokenizer.apply_chat_template(messages_full, tokenize=False, add_generation_prompt=False))
+            prompt_texts.append(tokenizer.apply_chat_template(messages_prompt, tokenize=False, add_generation_prompt=True))
 
-            full = tokenizer(full_text, return_tensors="pt", truncation=True, max_length=max_length)
-            prompt_tok = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=max_length)
+        full = tokenizer(
+            full_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+        )
+        prompt_tok = tokenizer(
+            prompt_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+        )
 
-            full_ids = full["input_ids"][0]
-            prompt_len = int(prompt_tok["input_ids"].shape[1])
+        input_ids = full["input_ids"]
+        attention_mask = full.get("attention_mask", torch.ones_like(input_ids))
+        labels = input_ids.clone()
 
-            labels = full_ids.clone()
-            labels[:prompt_len] = -100
-            attn = full.get("attention_mask", torch.ones_like(full_ids))
-            if attn.dim() > 1:
-                attn = attn[0]
+        prompt_attn = prompt_tok.get("attention_mask", None)
+        if prompt_attn is None:
+            prompt_lens = torch.sum(prompt_tok["input_ids"] != tokenizer.pad_token_id, dim=1)
         else:
-            # fallback: train only answer tokens
-            full = tokenizer(answer, return_tensors="pt", truncation=True, max_length=max_length)
-            full_ids = full["input_ids"][0]
-            labels = full_ids.clone()
-            attn = full.get("attention_mask", torch.ones_like(full_ids))
-            if attn.dim() > 1:
-                attn = attn[0]
+            prompt_lens = prompt_attn.sum(dim=1)
 
-        input_ids_list.append(full_ids)
-        labels_list.append(labels)
-        attn_list.append(attn)
+        seq_len = int(labels.size(1))
+        for i in range(int(labels.size(0))):
+            n = int(prompt_lens[i].item())
+            if n > seq_len:
+                n = seq_len
+            if n > 0:
+                labels[i, :n] = -100
+    else:
+        # fallback: train only answer tokens
+        full = tokenizer(
+            answers,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+        )
+        input_ids = full["input_ids"]
+        attention_mask = full.get("attention_mask", torch.ones_like(input_ids))
+        labels = input_ids.clone()
 
-    pad_id = tokenizer.pad_token_id
-    input_ids = torch.nn.utils.rnn.pad_sequence(input_ids_list, batch_first=True, padding_value=pad_id).to(device)
-    labels = torch.nn.utils.rnn.pad_sequence(labels_list, batch_first=True, padding_value=-100).to(device)
-    attention_mask = torch.nn.utils.rnn.pad_sequence(attn_list, batch_first=True, padding_value=0).to(device)
-    return input_ids, attention_mask, labels
+    if device is None:
+        return input_ids, attention_mask, labels
+    return input_ids.to(device), attention_mask.to(device), labels.to(device)
 
 
 def parse_val_check_interval(x: float) -> float | int:
@@ -161,4 +176,3 @@ def parse_precision(v: str) -> int | str:
     if s.lstrip("-").isdigit():
         return int(s)
     return s
-
