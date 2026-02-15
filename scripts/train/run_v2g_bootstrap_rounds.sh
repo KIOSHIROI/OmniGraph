@@ -7,14 +7,29 @@ cd "$WORKDIR"
 PYTHON_BIN=${PYTHON_BIN:-python}
 REPO=${REPO:-"$WORKDIR"}
 GPU=${GPU:-0}
+AUTO_BUILD_MANIFESTS=${AUTO_BUILD_MANIFESTS:-1}
+MANIFEST_BUILDER=${MANIFEST_BUILDER:-"$REPO/scripts/data_prep/build_bootstrap_manifests.py"}
 
 # Data manifests
 V2G_TRAIN_MANIFEST=${V2G_TRAIN_MANIFEST:-"$REPO/data/vg/v2g_train_manifest.jsonl"}
 V2G_VAL_MANIFEST=${V2G_VAL_MANIFEST:-""}
 VT_MANIFEST_R1=${VT_MANIFEST_R1:-"$REPO/data/vt/vt_manifest_round1.jsonl"}
 VT_MANIFEST_R2=${VT_MANIFEST_R2:-"$VT_MANIFEST_R1"}
+VG_SCENE_GRAPHS=${VG_SCENE_GRAPHS:-"$REPO/data/vg/contents/sceneGraphs/scene_graphs.json"}
+VG_REGIONS=${VG_REGIONS:-"$REPO/data/vg/contents/regionDescriptions/region_descriptions.json"}
 V2G_IMAGE_ROOT=${V2G_IMAGE_ROOT:-"$REPO/data/vg"}
-VT_IMAGE_ROOT=${VT_IMAGE_ROOT:-"$REPO/data"}
+COCO_IMAGE_ROOT=${COCO_IMAGE_ROOT:-}
+VT_IMAGE_ROOT=${VT_IMAGE_ROOT:-}
+if [ -z "$VT_IMAGE_ROOT" ]; then
+  if [ -n "$COCO_IMAGE_ROOT" ]; then
+    VT_IMAGE_ROOT="$COCO_IMAGE_ROOT"
+  else
+    VT_IMAGE_ROOT="$REPO/data"
+  fi
+fi
+if [ -z "$COCO_IMAGE_ROOT" ]; then
+  COCO_IMAGE_ROOT="$VT_IMAGE_ROOT"
+fi
 
 # Output dirs
 V2G_DIR=${V2G_DIR:-"$REPO/checkpoints_v2g/v2g_round1"}
@@ -67,6 +82,20 @@ FILTER_VISION_SIM_THRESH=${FILTER_VISION_SIM_THRESH:-0.25}
 FILTER_SCORE_THRESH=${FILTER_SCORE_THRESH:-0.72}
 
 mkdir -p "$V2G_DIR" "$PSEUDO_DIR"
+
+if [ "$AUTO_BUILD_MANIFESTS" = "1" ]; then
+  if [ ! -f "$V2G_TRAIN_MANIFEST" ] || [ ! -f "$VT_MANIFEST_R1" ] || [ ! -f "$VT_MANIFEST_R2" ]; then
+    echo "[Manifest] missing files detected, auto-building manifests..."
+    "$PYTHON_BIN" "$MANIFEST_BUILDER" \
+      --coco_root "$COCO_IMAGE_ROOT" \
+      --vg_scene_graphs "$VG_SCENE_GRAPHS" \
+      --vg_regions "$VG_REGIONS" \
+      --vg_image_root "$V2G_IMAGE_ROOT" \
+      --out_vt_round1 "$VT_MANIFEST_R1" \
+      --out_vt_round2 "$VT_MANIFEST_R2" \
+      --out_v2g_train "$V2G_TRAIN_MANIFEST"
+  fi
+fi
 
 if [ ! -f "$V2G_TRAIN_MANIFEST" ]; then
   echo "[V2G] missing train manifest: $V2G_TRAIN_MANIFEST"

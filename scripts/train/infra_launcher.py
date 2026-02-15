@@ -56,6 +56,13 @@ DATA_PATH_KEYS = {
     "GQA_EVAL_PAPER",
     "GQA_PRED_R2",
     "GQA_EVAL_R2",
+    "COCO_ROOT",
+    "COCO_IMAGE_ROOT",
+    "VT_IMAGE_ROOT",
+    "VT_MANIFEST_R1",
+    "VT_MANIFEST_R2",
+    "V2G_TRAIN_MANIFEST",
+    "V2G_VAL_MANIFEST",
 }
 
 

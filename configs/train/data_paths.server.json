@@ -3,6 +3,7 @@
   "VG_SCENE_GRAPHS": "/root/autodl-tmp/vg/sceneGraphs/scene_graphs.json",
   "VG_REGIONS": "/root/autodl-tmp/vg/regionDescriptions/region_descriptions.json",
   "VG_IMAGE_ROOT": "/root/autodl-tmp/vg/images",
+  "COCO_IMAGE_ROOT": "/root/autodl-pub/COCO2017",
   "GQA_QUESTIONS_JSON": "/root/autodl-tmp/gqa/questions/val_balanced_questions.json",
   "GQA_SCENE_RAW": "/root/autodl-tmp/gqa/sceneGraphs/val_sceneGraphs.json",
   "GQA_IMAGE_ROOT": "/root/autodl-tmp/gqa/images"
