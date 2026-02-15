@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import errno
 import sys
 import json
 import argparse
@@ -760,6 +761,7 @@ class PeriodicSaveLastCheckpoint(pl.Callback):
         super().__init__()
         self.every_n_steps = max(1, int(every_n_steps))
         self.ckpt_path = str(ckpt_path)
+        self._disk_full_warned = False
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):  # type: ignore[override]
         step = int(getattr(trainer, "global_step", 0))
@@ -767,7 +769,19 @@ class PeriodicSaveLastCheckpoint(pl.Callback):
             return
         if step % self.every_n_steps != 0:
             return
-        trainer.save_checkpoint(self.ckpt_path)
+        try:
+            trainer.save_checkpoint(self.ckpt_path)
+            self._disk_full_warned = False
+        except OSError as exc:
+            if getattr(exc, "errno", None) == errno.ENOSPC:
+                if not self._disk_full_warned:
+                    print(
+                        f"[MultiModalTune][Warn] skip periodic checkpoint at step={step}: "
+                        f"no space left on device for {self.ckpt_path}"
+                    )
+                    self._disk_full_warned = True
+                return
+            raise
 
 
 class ManualEarlyStopByFile(pl.Callback):
