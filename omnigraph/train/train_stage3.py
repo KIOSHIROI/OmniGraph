@@ -951,10 +951,11 @@ class Stage3PL(pl.LightningModule):
 class PeriodicSaveLastCheckpoint(pl.Callback):
     """Force-save trainer state to last.ckpt every N steps for OOM recovery."""
 
-    def __init__(self, every_n_steps: int, ckpt_path: str):
+    def __init__(self, every_n_steps: int, ckpt_path: str, save_weights_only: bool = True):
         super().__init__()
         self.every_n_steps = max(1, int(every_n_steps))
         self.ckpt_path = str(ckpt_path)
+        self.save_weights_only = bool(save_weights_only)
         self._disk_full_warned = False
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):  # type: ignore[override]
@@ -964,7 +965,7 @@ class PeriodicSaveLastCheckpoint(pl.Callback):
         if step % self.every_n_steps != 0:
             return
         try:
-            trainer.save_checkpoint(self.ckpt_path)
+            trainer.save_checkpoint(self.ckpt_path, weights_only=self.save_weights_only)
             self._disk_full_warned = False
         except OSError as exc:
             if getattr(exc, "errno", None) == errno.ENOSPC:
@@ -981,11 +982,18 @@ class PeriodicSaveLastCheckpoint(pl.Callback):
 class ManualEarlyStopByFile(pl.Callback):
     """Allow manual early-stop by creating a signal file during training."""
 
-    def __init__(self, stop_file: str, stage_tag: str, save_ckpt_path: Optional[str] = None):
+    def __init__(
+        self,
+        stop_file: str,
+        stage_tag: str,
+        save_ckpt_path: Optional[str] = None,
+        save_weights_only: bool = True,
+    ):
         super().__init__()
         self.stop_file = str(stop_file)
         self.stage_tag = str(stage_tag)
         self.save_ckpt_path = str(save_ckpt_path) if save_ckpt_path else ""
+        self.save_weights_only = bool(save_weights_only)
         self._triggered = False
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):  # type: ignore[override]
@@ -997,8 +1005,13 @@ class ManualEarlyStopByFile(pl.Callback):
         print(f"[{self.stage_tag}] manual early-stop signal detected: {self.stop_file} (step={step})")
         if self.save_ckpt_path:
             try:
-                trainer.save_checkpoint(self.save_ckpt_path)
+                trainer.save_checkpoint(self.save_ckpt_path, weights_only=self.save_weights_only)
                 print(f"[{self.stage_tag}] saved manual-stop checkpoint: {self.save_ckpt_path}")
+            except OSError as exc:
+                if getattr(exc, "errno", None) == errno.ENOSPC:
+                    print(f"[{self.stage_tag}][Warn] skip manual-stop checkpoint (disk full): {self.save_ckpt_path}")
+                else:
+                    print(f"[{self.stage_tag}][Warn] failed to save manual-stop checkpoint: {exc}")
             except Exception as exc:
                 print(f"[{self.stage_tag}][Warn] failed to save manual-stop checkpoint: {exc}")
         trainer.should_stop = True
@@ -1083,7 +1096,9 @@ def main():
 
     ap.add_argument("--save_dir", type=str, default="checkpoints_multimodal_tune")
     ap.add_argument("--resume_from_checkpoint", type=str, default="", help="Resume full trainer state from this checkpoint.")
-    ap.add_argument("--checkpoint_every_n_steps", type=int, default=1000, help="Force-save last.ckpt every N train steps (0 to disable).")
+    ap.add_argument("--checkpoint_every_n_steps", type=int, default=0, help="Force-save last.ckpt every N train steps (0 to disable).")
+    ap.add_argument("--checkpoint_save_weights_only", type=int, default=1, choices=[0, 1], help="Checkpoint saves model weights only.")
+    ap.add_argument("--checkpoint_save_last", type=int, default=0, choices=[0, 1], help="Also save last checkpoint on every validation end.")
     ap.add_argument("--manual_stop_file", type=str, default="", help="If this file appears during training, trigger graceful early stop.")
 
     ap.add_argument("--min_freq", type=int, default=2)
@@ -1297,7 +1312,8 @@ def main():
         save_top_k=1,
         monitor="val_loss",
         mode="min",
-        save_last=True,
+        save_last=bool(int(args.checkpoint_save_last)),
+        save_weights_only=bool(int(args.checkpoint_save_weights_only)),
     )
     lr_monitor = LearningRateMonitor(logging_interval="step")
     es = EarlyStopping(
@@ -1327,13 +1343,20 @@ def main():
             stop_file=manual_stop_file,
             stage_tag="MultiModalTune",
             save_ckpt_path=str(save_dir / "manual_stop.ckpt"),
+            save_weights_only=bool(int(args.checkpoint_save_weights_only)),
         )
     )
     print(f"[MultiModalTune] manual early-stop enabled: touch file -> {manual_stop_file}")
     ckpt_every_n = max(0, int(args.checkpoint_every_n_steps))
     if ckpt_every_n > 0:
         periodic_ckpt_path = save_dir / "last.ckpt"
-        callbacks.append(PeriodicSaveLastCheckpoint(every_n_steps=ckpt_every_n, ckpt_path=str(periodic_ckpt_path)))
+        callbacks.append(
+            PeriodicSaveLastCheckpoint(
+                every_n_steps=ckpt_every_n,
+                ckpt_path=str(periodic_ckpt_path),
+                save_weights_only=bool(int(args.checkpoint_save_weights_only)),
+            )
+        )
         print(f"[MultiModalTune] periodic last.ckpt save enabled: every_n_steps={ckpt_every_n} path={periodic_ckpt_path}")
 
     use_gpu = torch.cuda.is_available() and int(args.gpu) >= 0

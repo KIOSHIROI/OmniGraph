@@ -66,6 +66,12 @@ def _read_jsonl(path: str) -> List[Dict[str, Any]]:
     return out
 
 
+def _trainable_only_state_dict(module: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    trainable_keys = {name for name, p in module.named_parameters() if p.requires_grad}
+    full_sd = module.state_dict()
+    return {k: v for k, v in full_sd.items() if k in trainable_keys}
+
+
 def _resolve_image_path(image_path: str, image_root: str) -> Optional[str]:
     raw = str(image_path or "").strip()
     if not raw:
@@ -263,6 +269,10 @@ def main() -> int:
     ap.add_argument("--train_lm_head", type=int, default=0, choices=[0, 1])
 
     ap.add_argument("--lora_r", type=int, default=0, help="Reserved for optional PEFT; 0 disables.")
+    ap.add_argument("--save_top_k", type=int, default=0, help="ModelCheckpoint save_top_k. 0 disables top-k ckpt saves.")
+    ap.add_argument("--save_last_ckpt", type=int, default=0, choices=[0, 1], help="Whether to save last.ckpt during training.")
+    ap.add_argument("--checkpoint_save_weights_only", type=int, default=1, choices=[0, 1], help="Checkpoint saves model weights only.")
+    ap.add_argument("--export_trainable_only", type=int, default=1, choices=[0, 1], help="Export only trainable params to v2g_state_dict.pt.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--gpu", type=int, default=0)
     ap.add_argument("--save_dir", required=True)
@@ -346,14 +356,19 @@ def main() -> int:
     if vci > 1.0:
         vci = int(vci)
 
-    ckpt_cb = ModelCheckpoint(
-        dirpath=str(save_dir),
-        filename="v2g-step={step:07d}-val_loss={val_loss:.4f}",
-        save_top_k=1,
-        monitor="val_loss",
-        mode="min",
-        save_last=True,
-    )
+    ckpt_top_k = max(0, int(args.save_top_k))
+    save_last_ckpt = bool(int(args.save_last_ckpt))
+    ckpt_cb = None
+    if ckpt_top_k > 0 or save_last_ckpt:
+        ckpt_cb = ModelCheckpoint(
+            dirpath=str(save_dir),
+            filename="v2g-step={step:07d}-val_loss={val_loss:.4f}",
+            save_top_k=ckpt_top_k,
+            monitor="val_loss",
+            mode="min",
+            save_last=save_last_ckpt,
+            save_weights_only=bool(int(args.checkpoint_save_weights_only)),
+        )
     es = EarlyStopping(
         monitor="val_loss",
         mode="min",
@@ -368,13 +383,17 @@ def main() -> int:
     if use_gpu and int(args.gpu) >= torch.cuda.device_count():
         raise ValueError(f"--gpu={args.gpu} out of range (device_count={torch.cuda.device_count()}).")
 
+    callbacks = [es, lr_monitor]
+    if ckpt_cb is not None:
+        callbacks.insert(0, ckpt_cb)
+
     trainer = pl.Trainer(
         accelerator="gpu" if use_gpu else "cpu",
         devices=devices,
         precision=_parse_precision(str(args.precision)),
         max_steps=max(1, int(args.max_steps)),
         max_epochs=999999,
-        callbacks=[ckpt_cb, es, lr_monitor],
+        callbacks=callbacks,
         log_every_n_steps=10,
         gradient_clip_val=1.0,
         accumulate_grad_batches=max(1, int(args.accumulate_grad_batches)),
@@ -389,7 +408,11 @@ def main() -> int:
     trainer.fit(pl_model, train_loader, val_loader)
 
     export_path = save_dir / "v2g_state_dict.pt"
-    torch.save(pl_model.synthesizer.state_dict(), str(export_path))
+    if bool(int(args.export_trainable_only)):
+        export_state = _trainable_only_state_dict(pl_model.synthesizer)
+    else:
+        export_state = pl_model.synthesizer.state_dict()
+    torch.save(export_state, str(export_path))
 
     meta = {
         "train_manifest": str(args.train_manifest),
@@ -399,18 +422,19 @@ def main() -> int:
         "torch_dtype": str(args.torch_dtype),
         "max_length": int(args.max_length),
         "max_new_tokens": int(args.max_new_tokens),
-        "best_ckpt": ckpt_cb.best_model_path or "",
-        "last_ckpt": str(save_dir / "last.ckpt"),
+        "best_ckpt": ((ckpt_cb.best_model_path or "") if ckpt_cb is not None else ""),
+        "last_ckpt": (str(save_dir / "last.ckpt") if save_last_ckpt else ""),
         "export_path": str(export_path),
         "train_size": len(train_ds),
         "val_size": len(val_ds),
         "trainable_params": int(pl_model.synthesizer.count_trainable_params()),
+        "export_trainable_only": bool(int(args.export_trainable_only)),
         "config": pl_model.synthesizer.as_config_dict(),
     }
     (save_dir / "v2g_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"[Export] {export_path}")
-    print(f"[Best] {ckpt_cb.best_model_path}")
+    print(f"[Best] {(ckpt_cb.best_model_path if ckpt_cb is not None else '')}")
     return 0
 
 

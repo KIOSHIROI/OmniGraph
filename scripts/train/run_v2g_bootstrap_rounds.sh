@@ -67,6 +67,10 @@ V2G_PATIENCE=${V2G_PATIENCE:-12}
 V2G_MIN_DELTA=${V2G_MIN_DELTA:-0.0005}
 V2G_LR=${V2G_LR:-1e-4}
 V2G_WEIGHT_DECAY=${V2G_WEIGHT_DECAY:-0.01}
+V2G_SAVE_TOP_K=${V2G_SAVE_TOP_K:-0}
+V2G_SAVE_LAST_CKPT=${V2G_SAVE_LAST_CKPT:-0}
+V2G_CKPT_SAVE_WEIGHTS_ONLY=${V2G_CKPT_SAVE_WEIGHTS_ONLY:-1}
+V2G_EXPORT_TRAINABLE_ONLY=${V2G_EXPORT_TRAINABLE_ONLY:-1}
 
 NUM_CANDIDATES=${NUM_CANDIDATES:-3}
 SYNTH_BATCH_SIZE=${SYNTH_BATCH_SIZE:-1}
@@ -163,6 +167,10 @@ V2G_CMD=("$PYTHON_BIN" "$REPO/omnigraph/train/train_v2g_synthesizer.py" \
   --val_check_interval "$V2G_VAL_CHECK_INTERVAL" \
   --patience "$V2G_PATIENCE" \
   --min_delta "$V2G_MIN_DELTA" \
+  --save_top_k "$V2G_SAVE_TOP_K" \
+  --save_last_ckpt "$V2G_SAVE_LAST_CKPT" \
+  --checkpoint_save_weights_only "$V2G_CKPT_SAVE_WEIGHTS_ONLY" \
+  --export_trainable_only "$V2G_EXPORT_TRAINABLE_ONLY" \
   --gpu "$GPU" \
   --save_dir "$V2G_DIR")
 if [ -n "${V2G_VAL_MANIFEST}" ]; then

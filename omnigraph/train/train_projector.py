@@ -909,7 +909,7 @@ def main():
 
     ap.add_argument("--save_dir", type=str, default="checkpoints_projector_vg/graph_bootstrap")
     ap.add_argument("--resume_from_checkpoint", type=str, default="", help="Resume full trainer state from this checkpoint.")
-    ap.add_argument("--checkpoint_every_n_steps", type=int, default=1000, help="Force-save last.ckpt every N train steps (0 to disable).")
+    ap.add_argument("--checkpoint_every_n_steps", type=int, default=0, help="Force-save last.ckpt every N train steps (0 to disable).")
     ap.add_argument("--manual_stop_file", type=str, default="", help="If this file appears during training, trigger graceful early stop.")
     ap.add_argument("--disable_graph_qa", action="store_true", help="Disable synthetic graph QA from VG scene graphs.")
     ap.add_argument("--graph_qa_max_per_image", type=int, default=3, help="Max synthetic QA pairs per image.")
