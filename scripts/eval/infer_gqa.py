@@ -7,7 +7,7 @@ import re
 import sys
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # repo bootstrap
 _repo_root = Path(__file__).resolve().parents[2]
@@ -22,7 +22,13 @@ import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset, Subset
 from transformers import AutoProcessor, AutoTokenizer
 
-from omnigraph.data.vg_scene_graph_dataset import VGSceneGraphDataset, build_vg_vocabs_from_file
+from omnigraph.data.vg_scene_graph_dataset import (
+    VGSceneGraphDataset,
+    build_vg_vocabs_from_file,
+    build_vg_vocabs_from_items,
+    load_vg_scene_graph_items,
+    merge_scene_graph_items,
+)
 from omnigraph.model.OmniGraphModel import OmniGraphModel
 
 
@@ -129,6 +135,80 @@ def _normalize_graph_tokenizer_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "ff_mult": int(cfg.get("ff_mult", 4)),
         "dropout": float(cfg.get("dropout", 0.0)),
     }
+
+
+def _safe_int(x: Any, default: int) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return int(default)
+
+
+def _extract_train_vocab_sources_from_meta(stage3_meta: Dict[str, Any]) -> Tuple[Optional[str], List[str]]:
+    if not isinstance(stage3_meta, dict):
+        return None, []
+    src = stage3_meta.get("scene_graph_sources", {})
+    if not isinstance(src, dict):
+        return None, []
+    base = str(src.get("base_scene_graphs", "")).strip() or None
+    extras_raw = src.get("extra_scene_graphs", [])
+    extras: List[str] = []
+    if isinstance(extras_raw, list):
+        for p in extras_raw:
+            t = str(p).strip()
+            if t:
+                extras.append(t)
+    return base, extras
+
+
+def _build_vocabs_with_train_alignment(
+    eval_scene_graphs: str,
+    min_freq: int,
+    stage3_meta: Dict[str, Any],
+    prefer_train_vocab_from_meta: bool,
+):
+    if bool(prefer_train_vocab_from_meta):
+        base_sg, extra_sg = _extract_train_vocab_sources_from_meta(stage3_meta)
+        if base_sg:
+            src_paths = [base_sg] + list(extra_sg)
+            missing = [p for p in src_paths if not Path(p).exists()]
+            if not missing:
+                base_items = load_vg_scene_graph_items(base_sg)
+                extra_items_list = [load_vg_scene_graph_items(p) for p in extra_sg]
+                merged_items, merge_stats = merge_scene_graph_items(base_items, extra_items_list)
+                vocabs = build_vg_vocabs_from_items(merged_items, min_freq=int(min_freq))
+                info = {
+                    "source": "train_meta",
+                    "base_scene_graphs": base_sg,
+                    "extra_scene_graphs_count": len(extra_sg),
+                    "merged_kept": int(merge_stats.get("kept", 0)),
+                }
+                return vocabs, info
+            print(f"[Vocab][Warn] train-meta scene graph paths missing -> fallback to eval scene_graphs: {missing}")
+
+    vocabs = build_vg_vocabs_from_file(eval_scene_graphs, min_freq=int(min_freq))
+    info = {
+        "source": "eval_scene_graphs",
+        "base_scene_graphs": str(eval_scene_graphs),
+        "extra_scene_graphs_count": 0,
+        "merged_kept": -1,
+    }
+    return vocabs, info
+
+
+def _is_critical_weight_key(k: str) -> bool:
+    critical_prefixes = (
+        "llm.",
+        "node_encoder.",
+        "vg_adapter.",
+        "graph_qformer.",
+        "graph_branch.",
+        "gl_projector.",
+        "vision_branch.",
+        "vl_projector.",
+        "gvl_adapter.",
+    )
+    return str(k).startswith(critical_prefixes)
 
 
 class GQATriModalDataset(Dataset):
@@ -329,6 +409,27 @@ def main() -> int:
     ap.add_argument("--max_new_tokens", type=int, default=12)
     ap.add_argument("--gpu", type=int, default=0)
     ap.add_argument("--min_freq", type=int, default=2)
+    ap.add_argument(
+        "--prefer_train_vocab_from_meta",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="1: prefer rebuilding vocab from multimodal_tune_meta scene_graph_sources for ckpt alignment.",
+    )
+    ap.add_argument(
+        "--strict_vocab_match",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="1: fail if rebuilt vocab size differs from multimodal_tune_meta num_obj/num_attr.",
+    )
+    ap.add_argument(
+        "--strict_weight_load",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="1: fail-fast on critical key mismatches while loading checkpoint weights.",
+    )
     ap.add_argument("--max_nodes", type=int, default=80)
     ap.add_argument("--max_attrs", type=int, default=6)
     ap.add_argument("--disable_vision", action="store_true", help="disable vision branch at inference")
@@ -414,10 +515,30 @@ def main() -> int:
         f"gvl_adapter={resolved_enable_gvl_adapter} gvl_gate={resolved_gvl_adapter_gate_init}"
     )
 
-    obj_vocab, pred_vocab, attr_vocab = build_vg_vocabs_from_file(args.scene_graphs, min_freq=int(args.min_freq))
+    (obj_vocab, pred_vocab, attr_vocab), vocab_info = _build_vocabs_with_train_alignment(
+        eval_scene_graphs=str(args.scene_graphs),
+        min_freq=int(args.min_freq),
+        stage3_meta=stage3_meta,
+        prefer_train_vocab_from_meta=bool(int(args.prefer_train_vocab_from_meta)),
+    )
     num_obj = len(obj_vocab.stoi)
     num_attr = len(attr_vocab.stoi)
-    print(f"[Vocab] NUM_OBJ={num_obj} NUM_ATTR={num_attr}")
+    expected_num_obj = _safe_int(stage3_meta.get("num_obj"), num_obj) if isinstance(stage3_meta, dict) else num_obj
+    expected_num_attr = _safe_int(stage3_meta.get("num_attr"), num_attr) if isinstance(stage3_meta, dict) else num_attr
+    print(
+        "[Vocab] "
+        f"source={vocab_info.get('source')} NUM_OBJ={num_obj} NUM_ATTR={num_attr} "
+        f"expected_from_meta=({expected_num_obj},{expected_num_attr})"
+    )
+    if (num_obj != expected_num_obj) or (num_attr != expected_num_attr):
+        msg = (
+            "Vocabulary size mismatch against training meta: "
+            f"rebuilt=({num_obj},{num_attr}) vs meta=({expected_num_obj},{expected_num_attr}). "
+            "This usually causes checkpoint embedding mismatch and accuracy drop."
+        )
+        if int(args.strict_vocab_match) == 1:
+            raise RuntimeError(msg)
+        print(f"[Vocab][Warn] {msg}")
 
     sg_dataset = VGSceneGraphDataset(
         scene_graphs_path=args.scene_graphs,
@@ -494,19 +615,71 @@ def main() -> int:
         gvl_adapter_gate_init=resolved_gvl_adapter_gate_init,
         enable_graph_aux_head=False,
     )
-    sd = torch.load(args.ckpt, map_location="cpu")
+    raw_sd = torch.load(args.ckpt, map_location="cpu")
+    if isinstance(raw_sd, dict) and "state_dict" in raw_sd and isinstance(raw_sd["state_dict"], dict):
+        ckpt_sd = raw_sd["state_dict"]
+        if any(str(k).startswith("model.") for k in ckpt_sd.keys()):
+            sd = {str(k)[len("model.") :] if str(k).startswith("model.") else str(k): v for k, v in ckpt_sd.items()}
+        else:
+            sd = {str(k): v for k, v in ckpt_sd.items()}
+    elif isinstance(raw_sd, dict):
+        sd = {str(k): v for k, v in raw_sd.items()}
+    else:
+        raise RuntimeError(f"Unsupported checkpoint format for {args.ckpt}: expected dict/state_dict.")
+
     model_sd = model.state_dict()
-    filtered = {}
+    filtered: Dict[str, Any] = {}
     skipped = 0
+    mismatched: List[Tuple[str, Any, Any]] = []
+    unexpected_in_ckpt: List[str] = []
     for k, v in sd.items():
-        if k in model_sd and hasattr(v, "shape") and hasattr(model_sd[k], "shape"):
-            if v.shape != model_sd[k].shape:
-                skipped += 1
-                continue
+        if k not in model_sd:
+            unexpected_in_ckpt.append(str(k))
+            continue
+        if hasattr(v, "shape") and hasattr(model_sd[k], "shape") and v.shape != model_sd[k].shape:
+            skipped += 1
+            mismatched.append((str(k), tuple(v.shape), tuple(model_sd[k].shape)))
+            continue
         filtered[k] = v
-    if skipped:
-        print(f"[Init] Skipped {skipped} mismatched keys (vocab/adapter resize).")
-    model.load_state_dict(filtered, strict=False)
+    critical_mismatched = [m for m in mismatched if _is_critical_weight_key(m[0])]
+    critical_unexpected = [k for k in unexpected_in_ckpt if _is_critical_weight_key(k)]
+    if int(args.strict_weight_load) == 1 and (critical_mismatched or critical_unexpected):
+        msg_lines = ["Critical checkpoint/model key mismatch detected."]
+        if critical_mismatched:
+            msg_lines.append(f"critical shape mismatches={len(critical_mismatched)} (showing up to 8):")
+            for k, s1, s2 in critical_mismatched[:8]:
+                msg_lines.append(f"  - {k}: ckpt={s1} model={s2}")
+        if critical_unexpected:
+            msg_lines.append(f"critical unexpected ckpt keys={len(critical_unexpected)} (showing up to 8):")
+            for k in critical_unexpected[:8]:
+                msg_lines.append(f"  - {k}")
+        raise RuntimeError("\n".join(msg_lines))
+
+    if mismatched:
+        print(f"[Init][Warn] shape mismatches skipped={len(mismatched)} (critical={len(critical_mismatched)})")
+    if unexpected_in_ckpt:
+        print(f"[Init][Warn] unexpected ckpt keys ignored={len(unexpected_in_ckpt)} (critical={len(critical_unexpected)})")
+
+    missing, unexpected_after = model.load_state_dict(filtered, strict=False)
+    critical_missing = [k for k in missing if _is_critical_weight_key(str(k))]
+    critical_unexpected_after = [k for k in unexpected_after if _is_critical_weight_key(str(k))]
+    if int(args.strict_weight_load) == 1 and (critical_missing or critical_unexpected_after):
+        msg_lines = ["Critical missing/unexpected keys after load_state_dict."]
+        if critical_missing:
+            msg_lines.append(f"critical missing={len(critical_missing)} (showing up to 8):")
+            for k in critical_missing[:8]:
+                msg_lines.append(f"  - {k}")
+        if critical_unexpected_after:
+            msg_lines.append(f"critical unexpected={len(critical_unexpected_after)} (showing up to 8):")
+            for k in critical_unexpected_after[:8]:
+                msg_lines.append(f"  - {k}")
+        raise RuntimeError("\n".join(msg_lines))
+
+    if missing:
+        print(f"[Init][Warn] missing keys={len(missing)}")
+    if unexpected_after:
+        print(f"[Init][Warn] unexpected keys={len(unexpected_after)}")
+
     model.to(device)
     model.eval()
 

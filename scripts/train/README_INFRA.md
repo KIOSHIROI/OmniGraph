@@ -10,6 +10,13 @@ python scripts/train/infra_launcher.py --profile 4090 --mode full --gpu 0
 python scripts/train/infra_launcher.py --profile pro6000 --mode full --gpu 0
 ```
 
+Fast convergence preset (frequent validation + aggressive early-stop):
+
+```bash
+PROFILE=pro6000 GPU=0 DATA_CONFIG=configs/train/data_paths.server.json \
+  bash scripts/train/run_full_faststop.sh
+```
+
 If data is not under `<repo>/data`, set one root and keep all VG/GQA defaults derived from it:
 
 ```bash
